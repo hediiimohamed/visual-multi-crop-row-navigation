@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 class Camera:
     def __init__(self, id,deltax,deltay,deltaz,tilt_angle,height,width,focal_length,sensor_width):
         self.id = id

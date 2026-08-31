@@ -1,6 +1,5 @@
-#!/usr/bin/env python2
-from __future__ import division
-from __future__ import print_function
+ #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import scipy
 import cv2 as cv
@@ -14,10 +13,11 @@ from cv_bridge import CvBridge
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
 
-from contours import *
-from geometric import *
-from featureMatching import *
-from movingVariance import *
+# Fixed imports - add package name
+from visual_multi_crop_row_navigation.contours import *
+from visual_multi_crop_row_navigation.geometric import *
+from visual_multi_crop_row_navigation.featureMatching import *
+from visual_multi_crop_row_navigation.movingVariance import *
 
 class imageProc:
     def __init__(self, scannerParams, contourParams, roiParams, trackerParams):
@@ -61,14 +61,16 @@ class imageProc:
         # window parameters
         self.trackingWindowOffsTop = 0
         self.trackingWindowOffsBottom = 0
-        self.trackingWindowTopScaleRatio = 0.4  # scales the top of the window
+        self.trackingWindowTopScaleRatio = 0.4
 
         self.imgHeight, self.imgWidth = 720, 1280
 
-        # steps create linspace
-        self.scanFootSteps = np.linspace(self.scannerParams["scanStartPoint"],
-                                         self.scannerParams["scanEndPoint"],
-                                         self.scannerParams["scanWindowWidth"])
+        # CORRECTION: Utiliser scanSteps, pas scanWindowWidth
+        self.scanFootSteps = np.linspace(
+            self.scannerParams["scanStartPoint"],
+            self.scannerParams["scanEndPoint"],
+            self.scannerParams["scanSteps"])  # Changé ici
+        
         self.rowTrackingBoxes = []
         self.updateTrackingBoxes()
 
@@ -80,8 +82,14 @@ class imageProc:
             bushy (bool, optional): _description_. Defaults to False.
         """
         self.primaryRGBImg = rgbImg.copy()
-        self.primaryDepthImg = depthImg.copy()
+        if depthImg is not None:
+            self.primaryDepthImg = depthImg.copy()
+        else:
+            self.primaryDepthImg = None
+        prev_h, prev_w = self.imgHeight, self.imgWidth
         self.imgHeight, self.imgWidth, self.imgChannels = rgbImg.shape
+        if prev_h != self.imgHeight or prev_w != self.imgWidth:
+            self.updateTrackingBoxes()
         # if crop canopy type is busshy like Coriander
         self.bushy = bushy
         
@@ -101,16 +109,14 @@ class imageProc:
         return self.cropLaneFound
 
     def findCropRows3D(self, maskImg, plantCenters2D, depthImg):
+        if depthImg is None:
+            return [], []
         lines = []
         linesROIs = []
         # project the plant centers to 3D
-
         # cluster points 
-
         # fit line on each cluster
-
         # project back 3D points to image
-
         # return the resutls
         return lines, linesROIs
 
@@ -119,14 +125,37 @@ class imageProc:
         lines, linesROIs, _ = self.findLinesInImage()
         # if any feature is observed during the scan
         if len(lines) != 0:
+            print(f"DEBUG: lines found: {len(lines)}")
+            print(f"DEBUG: lines X positions: {[line[0] for line in lines[:10]]}")
             np.set_printoptions(suppress=True)
+            
+            # Vérifier qu'il y a assez de lignes pour calculer la moving std
+            if len(lines[:, 0]) <= 5:
+                print('--- Initialisation failed - Not enough lines for analysis ---')
+                self.cropLaneFound = False
+                return lines, linesROIs
+            
             # compute moving standard deviation
             mvSignal = movingStd(lines[:, 0])
+            
+            # Vérifier que mvSignal n'est pas vide
+            if len(mvSignal) == 0:
+                print('--- Initialisation failed - Moving std returned empty ---')
+                self.cropLaneFound = False
+                return lines, linesROIs
+            
             # find positive an negative peaks of the signal
             peaksPos, peaksNeg = findPicksTroughths(mvSignal, 0.5)
             # locate best lines
             self.CropRows, self.trackingBoxLoc = self.findCropRowsInMVSignal(peaksPos, peaksNeg,
                                                         mvSignal, lines, linesROIs)
+            
+            # Ajouter cette vérification
+            if len(self.CropRows) == 0 or len(self.trackingBoxLoc) == 0:
+                print('--- Initialisation failed - No valid crop rows found ---')
+                self.cropLaneFound = False
+                return lines, linesROIs
+            
             self.numOfCropRows = len(self.trackingBoxLoc)
             self.lostCropRows = list(np.zeros(self.numOfCropRows))
             # if there is any proper line to follow
@@ -181,7 +210,7 @@ class imageProc:
                         # location of the window which led to this line
                         if linesROIs[peaksNegLine[bestLine]] != [0]:
                             windowLocations[lidx,
-                                                 :] = linesROIs[peaksNegLine[bestLine]]
+                                                :] = linesROIs[peaksNegLine[bestLine]]
                             lidx += 1
             except:
 
@@ -204,10 +233,25 @@ class imageProc:
             qualifiedLines = []
             windowLocations = []
         
+        # Ajouter cette vérification
+        if len(qualifiedLines) == 0 or qualifiedLines.size == 0:
+            return np.array([]), np.array([])
+        
+        # Vérifier que qualifiedLines a au moins 1 dimension avant d'utiliser axis=1
+        if qualifiedLines.ndim == 1:
+            qualifiedLines = qualifiedLines.reshape(1, -1)
+        
         qualifiedLines = qualifiedLines[~np.all(qualifiedLines == 0, axis=1)]
+        
+        if len(windowLocations) == 0 or windowLocations.size == 0:
+            return qualifiedLines, np.array([])
+        
+        if windowLocations.ndim == 1:
+            windowLocations = windowLocations.reshape(1, -1)
+        
         windowLocations = windowLocations[~np.all(windowLocations == 0, axis=1)]
 
-        return qualifiedLines,  windowLocations
+        return qualifiedLines, windowLocations
 
     def findLinesInImage(self):
         """function to get lines at given window locations 
@@ -279,35 +323,49 @@ class imageProc:
 
     def updateTrackingBoxes(self, boxID=0, lineIntersection=None):
 
-        if not self.isInitialized and lineIntersection==None:
-            # initial tracking Boxes 
+        if not self.isInitialized and lineIntersection is None:
+            self.rowTrackingBoxes = []
             for i in range(len(self.scanFootSteps)):
-                # window is centered around self.scanFootSteps[i]
-                boxBL_x = self.scanFootSteps[i]
-                boxBR_x = self.scanFootSteps[i] + self.trackerParams["trackingBoxWidth"]
-                boxTL_x = int(boxBL_x - self.trackerParams["trackingBoxWidth"]/2 * self.trackerParams["sacleRatio"])
-                boxTR_x = int(boxTL_x + self.trackerParams["trackingBoxWidth"] * self.trackerParams["sacleRatio"])
+                center_x = self.scanFootSteps[i]
+
+                bottom_half = self.trackerParams["trackingBoxWidth"] / 2.0
+                top_half = (self.trackerParams["trackingBoxWidth"] * self.trackerParams["sacleRatio"]) / 2.0
+
+                boxBL_x = int(center_x - bottom_half)
+                boxBR_x = int(center_x + bottom_half)
+                boxTL_x = int(center_x - top_half)
+                boxTR_x = int(center_x + top_half)
+
                 boxT_y = self.trackerParams["bottomOffset"]
                 boxB_y = self.imgHeight - self.trackerParams["topOffset"]
-                # store the corner points
-                self.rowTrackingBoxes.append(Polygon([(boxBR_x, boxB_y),
-                                                      (boxBL_x, boxB_y), 
-                                                      (boxTL_x, boxT_y),
-                                                      (boxTR_x, boxT_y)]))
+
+                self.rowTrackingBoxes.append(Polygon([
+                    (boxBR_x, boxB_y),
+                    (boxBL_x, boxB_y),
+                    (boxTL_x, boxT_y),
+                    (boxTR_x, boxT_y)
+                ]))
         else:
-            # window corner points are left and right of these
-            boxBL_x = int(lineIntersection[0] - self.trackerParams["trackingBoxWidth"]/2)
-            boxBR_x = int(boxBL_x + self.trackerParams["trackingBoxWidth"])
-            boxTL_x = int(lineIntersection[1] - self.trackerParams["trackingBoxWidth"]/2 * self.trackerParams["sacleRatio"])
-            boxTR_x = int(boxTL_x + self.trackerParams["trackingBoxWidth"] * self.trackerParams["sacleRatio"])
+            center_bottom = lineIntersection[0]
+            center_top = lineIntersection[1]
+
+            bottom_half = self.trackerParams["trackingBoxWidth"] / 2.0
+            top_half = (self.trackerParams["trackingBoxWidth"] * self.trackerParams["sacleRatio"]) / 2.0
+
+            boxBL_x = int(center_bottom - bottom_half)
+            boxBR_x = int(center_bottom + bottom_half)
+            boxTL_x = int(center_top - top_half)
+            boxTR_x = int(center_top + top_half)
+
             boxT_y = self.trackerParams["bottomOffset"]
             boxB_y = self.imgHeight - self.trackerParams["topOffset"]
-            # store the corner points
-            self.rowTrackingBoxes[boxID] = Polygon([(boxBR_x, boxB_y),
-                                                    (boxBL_x, boxB_y),
-                                                    (boxTL_x, boxT_y),
-                                                    (boxTR_x, boxT_y)])
 
+            self.rowTrackingBoxes[boxID] = Polygon([
+                (boxBR_x, boxB_y),
+                (boxBL_x, boxB_y),
+                (boxTL_x, boxT_y),
+                (boxTR_x, boxT_y)
+            ])
     def checkPlantsInRows(self, cropRowID, plantsInCroRow):
 
         if len(plantsInCroRow) >= 2:
@@ -377,74 +435,7 @@ class imageProc:
         else:
             self.cropRowEnd = False
 
-        return self.cropLaneFound, self.cropRowEnd, P, ang
-
-    def processRGBImage(self, rgbImg):
-        """function to extract the greenidx and the contour center points
-        Returns:
-            _type_: _description_
-        """
-        # change datatype to enable negative values for self.greenIDX calculation
-        rgbImg = rgbImg.astype('int32')
-        # apply ROI
-        rgbImg = self.applyROI(rgbImg)
-        #  get green index and binary mask (Otsu is used for extracting the green)
-        mask, greenIDX = self.getExgMask(rgbImg)
-        # find contours
-        plantObjects = getPlantMasks(
-            mask, self.contourParams["minContourArea"], bushy=False)
-        # get center of contours
-        contCenterPTS = getContourCenter(plantObjects)
-        x = contCenterPTS[:, 1]
-        y = contCenterPTS[:, 0]
-        # cv.imshow("RGB image",mask.astype('uint8'))
-        # self.handleKey(0)
-        return mask, greenIDX, plantObjects, np.array([x, y])
-
-    def getExgMask(self, img):
-        """Function to compute the green index of the image
-        """
-        _img = img.copy()
-
-        _img = _img.astype('int32')
-        # Vegetation Mask
-        r = _img[:, :, 0]
-        g = _img[:, :, 1]
-        b = _img[:, :, 2]
-
-        # calculate Excess Green Index and filter out negative values
-        greenIDX = 2*g - r - b
-        greenIDX[greenIDX < 0] = 0
-        greenIDX = greenIDX.astype('uint8')
-
-        # Otsu's thresholding after gaussian smoothing
-        blur = cv.GaussianBlur(greenIDX, (5, 5), 0)
-        threshold, threshIMG = cv.threshold(
-            blur, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU)
-
-        # dilation
-        kernel = np.ones((10, 10), np.uint8)
-        binaryMask = cv.dilate(threshIMG, kernel, iterations=1)
-
-        # Erotion
-        # er_kernel = np.ones((10,10),dtype=np.uint8) # this must be tuned
-        # binaryMask= cv.erode(binaryMask, er_kernel)
-
-        return binaryMask, greenIDX
-
-    def applyROI(self, img):
-        _img = img.copy()
-        # defining ROI windown on the image
-        if self.roiParams["enable_roi"]:
-            r_pts = [self.roiParams["p1"], self.roiParams["p2"],
-                     self.roiParams["p3"], self.roiParams["p4"]]
-            l_pts = [self.roiParams["p5"], self.roiParams["p6"],
-                     self.roiParams["p7"], self.roiParams["p8"]]
-
-            cv.fillPoly(_img, np.array([r_pts]), (0, 0, 0))
-            cv.fillPoly(_img, np.array([l_pts]), (0, 0, 0))
-        return _img
-
+        return self.cropLaneFound, self.cropRowEnd, self.P, self.ang
     def cameraToImage(self, P):
         """function to transform the feature point from camera to image frame
         Args:
@@ -452,37 +443,177 @@ class imageProc:
         Returns:
             _type_: point in image Fr
         """
-        P[0] = P[0] - self.imgWidth/2
-        P[1] = P[1] - self.imgHeight/2
+        if len(P) >= 2:
+            P[0] = P[0] - self.imgWidth/2
+            P[1] = P[1] - self.imgHeight/2
         return P
+    def applySimpleROI(self, img):
+        """Applique une ROI rectangulaire simple pour la zone des rangées"""
+        _img = img.copy()
+        height, width = _img.shape[:2]
+        
+        # Garder seulement la partie centrale (éliminer les bords)
+        roi_start_x = int(width * 0.15)   # 15% depuis la gauche
+        roi_end_x = int(width * 0.85)     # 85% depuis la gauche
+        roi_start_y = int(height * 0.3)   # 30% depuis le haut (éliminer le ciel)
+        roi_end_y = height                # Garder jusqu'en bas
+        
+        # Créer un masque
+        mask = np.zeros((height, width), dtype=np.uint8)
+        mask[roi_start_y:roi_end_y, roi_start_x:roi_end_x] = 255
+        
+        # Appliquer le masque (ne garder que la zone d'intérêt)
+        _img = cv.bitwise_and(_img, _img, mask=mask)
+        
+        return _img
+    def processRGBImage(self, rgbImg):
+        """function to extract the greenidx and the contour center points
+        Returns:
+            _type_: _description_
+        """
+        print("\n" + "="*60)
+        print(">>> PROCESS RGB IMAGE IS RUNNING (SOURCE FILE VERSION) <<<")
+        print("="*60 + "\n")
+        # change datatype to enable negative values for self.greenIDX calculation
+        rgbImg = rgbImg.astype('int32')
+        
+        # # Appliquer ROI simple avant traitement
+        # rgbImg = self.applySimpleROI(rgbImg)
+        
+        # Commenté temporairement - éviter l'erreur
+        # apply ROI (polygon si configuré)
+        # rgbImg = self.applyROI(rgbImg)
+        
+        #  get green index and binary mask
+        mask, greenIDX = self.getExgMask(rgbImg)
+            
+        # Vérifier si le masque est valide
+        if mask is None or mask.size == 0 or np.max(mask) == 0:
+            print("Warning: Empty mask detected, returning empty results")
+            return mask, greenIDX, [], np.array([])
+        
+        # find contours
+        plantObjects = getPlantMasks(
+            mask, self.contourParams["minContourArea"], bushy=False)
+        
+        print(f"Number of plant objects found: {len(plantObjects)}")
+    
+        # Afficher la taille des 10 premiers contours
+        for i, cnt in enumerate(plantObjects[:10]):
+            area = cv.contourArea(cnt)
+            x, y, w, h = cv.boundingRect(cnt)
+            print(f"  Contour {i}: area={area:.0f}, bbox=({x},{y},{w},{h})")
+        
+        # get center of contours
+        if len(plantObjects) == 0:
+            print("No plant objects found")
+            return mask, greenIDX, plantObjects, np.array([])
+        
+        contCenterPTS = getContourCenter(plantObjects)
+        
+        if len(contCenterPTS) == 0:
+            return mask, greenIDX, plantObjects, np.array([])
+        
+        x = contCenterPTS[:, 1]
+        y = contCenterPTS[:, 0]
+        
+        return mask, greenIDX, plantObjects, np.array([x, y])
+
+    def getExgMask(self, img):
+        """Function to compute the green index of the image
+        """
+        print(f"DEBUG getExgMask: img shape={img.shape}, dtype={img.dtype}")
+        
+        _img = img.copy()
+        _img = _img.astype('int32')
+        
+        # Vegetation Mask
+        r = _img[:, :, 0]
+        g = _img[:, :, 1]
+        b = _img[:, :, 2]
+
+        # calculate Excess Green Index
+        greenIDX = 2*g - r - b
+        greenIDX[greenIDX < 0] = 0
+        greenIDX = greenIDX.astype('uint8')
+        
+        print(f"DEBUG: greenIDX shape={greenIDX.shape}, min={greenIDX.min()}, max={greenIDX.max()}")
+
+        # Otsu's thresholding after gaussian smoothing
+        blur = cv.GaussianBlur(greenIDX, (5, 5), 0)
+        threshold, threshIMG = cv.threshold(
+            blur, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+        
+        print(f"DEBUG: Otsu threshold={threshold}, threshIMG max={threshIMG.max()}")
+
+        # CORRECTION: Dilatation beaucoup plus petite
+        kernel = np.ones((3, 3), np.uint8)
+        binaryMask = cv.dilate(threshIMG, kernel, iterations=1)
+        
+        print(f"DEBUG: binaryMask shape={binaryMask.shape}, non-zero pixels={np.count_nonzero(binaryMask)}")
+
+        return binaryMask, greenIDX
+
+    def applyROI(self, img):
+        _img = img.copy()
+        # defining ROI windown on the image
+        if self.roiParams["enable_roi"]:
+            try:
+                r_pts = [self.roiParams["p1"], self.roiParams["p2"],
+                        self.roiParams["p3"], self.roiParams["p4"]]
+                l_pts = [self.roiParams["p5"], self.roiParams["p6"],
+                        self.roiParams["p7"], self.roiParams["p8"]]
+                
+                # Vérifier que les points sont valides
+                if len(r_pts) >= 3 and all(isinstance(p, (list, tuple)) for p in r_pts):
+                    cv.fillPoly(_img, np.array([r_pts], dtype=np.int32), (0, 0, 0))
+                if len(l_pts) >= 3 and all(isinstance(p, (list, tuple)) for p in l_pts):
+                    cv.fillPoly(_img, np.array([l_pts], dtype=np.int32), (0, 0, 0))
+            except Exception as e:
+                print(f"Error in applyROI: {e}")
+                pass
+        return _img
 
     def drawGraphics(self):
         """function to draw the lines and the windows onto the image (self.primaryRGBImg)
         """
-        if self.primaryRGBImg != []:
+        # Vérifier que primaryRGBImg existe et n'est pas vide
+        if self.primaryRGBImg is not None and len(self.primaryRGBImg) > 0:
             self.graphicsImg = self.primaryRGBImg.copy()
-            # main line
-            cv.line(self.graphicsImg, (int(self.mainLine_up[0]), int(self.mainLine_up[1])), (int(
-                self.mainLine_down[0]), int(self.mainLine_down[1])), (255, 0, 0), thickness=3)
+            
+            # Vérifier que les données nécessaires existent
+            if hasattr(self, 'mainLine_up') and hasattr(self, 'mainLine_down') and len(self.mainLine_up) > 0 and len(self.mainLine_down) > 0:
+                # main line
+                cv.line(self.graphicsImg, (int(self.mainLine_up[0]), int(self.mainLine_up[1])), (int(
+                    self.mainLine_down[0]), int(self.mainLine_down[1])), (255, 0, 0), thickness=3)
+            
             # contoures
-            cv.drawContours(self.graphicsImg,
-                            self.plantObjects2D, -1, (10, 50, 150), 3)
-            for i in range(0, len(self.allLineStart)):
-                # helper lines
-                cv.line(self.graphicsImg, (int(self.allLineStart[i, 0]), int(self.allLineStart[i, 1])), (int(
-                    self.allLineEnd[i, 0]), int(self.allLineEnd[i, 1])), (0, 255, 0), thickness=1)
+            if hasattr(self, 'plantObjects2D') and self.plantObjects2D is not None and len(self.plantObjects2D) > 0:
+                cv.drawContours(self.graphicsImg,
+                                self.plantObjects2D, -1, (10, 50, 150), 3)
+            
+            # helper lines
+            if hasattr(self, 'allLineStart') and len(self.allLineStart) > 0:
+                for i in range(0, len(self.allLineStart)):
+                    cv.line(self.graphicsImg, (int(self.allLineStart[i, 0]), int(self.allLineStart[i, 1])), (int(
+                        self.allLineEnd[i, 0]), int(self.allLineEnd[i, 1])), (0, 255, 0), thickness=1)
 
-            for i in range(self.numOfCropRows):
-                int_coords = lambda x: np.array(x).round().astype(np.int32)
-                exterior = [int_coords(self.rowTrackingBoxes[i].exterior.coords)]
-                cv.polylines(self.graphicsImg, exterior, True, (0, 255, 255))
+            # tracking boxes
+            if hasattr(self, 'rowTrackingBoxes') and self.rowTrackingBoxes is not None and len(self.rowTrackingBoxes) > 0:
+                for i in range(min(self.numOfCropRows, len(self.rowTrackingBoxes))):
+                    int_coords = lambda x: np.array(x).round().astype(np.int32)
+                    exterior = [int_coords(self.rowTrackingBoxes[i].exterior.coords)]
+                    cv.polylines(self.graphicsImg, exterior, True, (0, 255, 255))
 
-            for i in range(len(self.plantCenters2D[0])):
-                # draw point on countur centers
-                x = int(self.plantCenters2D[0, i])
-                y = int(self.plantCenters2D[1, i])
-                self.graphicsImg = cv.circle(
-                    self.graphicsImg, (x, y), 3, (255, 0, 255), 5)
+            # plant centers
+            if hasattr(self, 'plantCenters2D') and self.plantCenters2D is not None and len(self.plantCenters2D) > 0 and len(self.plantCenters2D[0]) > 0:
+                for i in range(len(self.plantCenters2D[0])):
+                    x = int(self.plantCenters2D[0, i])
+                    y = int(self.plantCenters2D[1, i])
+                    self.graphicsImg = cv.circle(
+                        self.graphicsImg, (x, y), 3, (255, 0, 255), 5)
+        else:
+            print("No primaryRGBImg to draw")
 
     def handleKey(self, sleepTime=0):
         key = cv.waitKey(sleepTime)

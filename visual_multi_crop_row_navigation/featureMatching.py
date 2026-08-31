@@ -1,13 +1,14 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import cv2 as cv
 import numpy as np
 import itertools
 import matplotlib.pyplot as plt
-from movingVariance import *
+from visual_multi_crop_row_navigation.movingVariance import *
 
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
-
 class featureMatching:
     def __init__(self, featureParams):
         self.featureParams = featureParams
@@ -102,7 +103,7 @@ class featureMatching:
     def filterKeypoints(self, keyPoints, descriptors, polygon):
         filteredKeypoints = []
         filteredDescriptors = []
-        for kp, des in itertools.izip(keyPoints, descriptors):
+        for kp, des in zip(keyPoints, descriptors):
             if polygon.contains(Point(kp.pt[0], kp.pt[1])):
                 filteredKeypoints.append(kp)    
                 filteredDescriptors.append(des)
@@ -143,7 +144,7 @@ class featureMatching:
         matchingKeypoints = []
         featureDescriptors = []
         # maintain the keypoints lying in the first window
-        for kp, desc in itertools.izip(keyPointsRaw, descriptorsRaw):
+        for kp, desc in zip(keyPointsRaw, descriptorsRaw):
             matchingKeypoints.append(kp)
             featureDescriptors.append(desc)
         return matchingKeypoints, featureDescriptors

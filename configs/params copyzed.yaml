@@ -1,0 +1,57 @@
+/**:
+  ros__parameters:
+    # Camera topics - Utilisez les topics ZED
+    frontColor_topic:  "front/rgb/image_raw" #"/zed/zed_node/rgb/color/rect/image"
+    frontDepth_topic: "/zed/zed_node/depth/depth_registered"
+    frontCameraInfo_topic: "/zed/zed_node/rgb/camera_info"
+    
+    backColor_topic: "/zed/zed_node/rgb/color/rect/image"
+    backDepth_topic: "/zed/zed_node/depth/depth_registered"
+    backCameraInfo_topic: "/zed/zed_node/rgb/camera_info"
+    
+    cmd_vel_topic: "/cmd_vel"
+    
+    # Navigation mode
+    navigationMode: 1
+    stationaryDebug: false
+    
+    # Scanner parameters - COHÉRENTS
+    # Scanner parameters
+    scanSteps: 40                # Plus de fenêtres de balayage
+    scanStartPoint: 100          # Commence plus à gauche
+    scanEndPoint: 1820           # Fini plus à droite
+    scanWindowWidth: 200        # Largeur de chaque fenêtre (utilisé pour les boîtes)
+    
+    # ROI parameters
+    enable_roi: false
+    p1: 0
+    p2: 0
+    p3: 0
+    p4: 0
+    p5: 0
+    p6: 0
+    p7: 0
+    p8: 0
+    
+    # Contour parameters
+    imgResizeRatio: 1.0
+    minContourArea: 30        # Réduit pour plus de détections
+    
+    # Feature matching parameters
+    linesToPass: 5
+    minKeypointNum: 10
+    maxMatchingDifference: 50
+    minMatchingDifference: 10
+    
+    # Tracker parameters
+    trackingBoxWidth: 250        # Boîtes plus larges
+    sacleRatio: 1.2              # Ratio plus grand
+    topOffset: 100
+    bottomOffset: 100
+    
+    # Speed limits
+    omegaScaler: 1.0
+    maxOmega: 1.0
+    minOmega: 0.1
+    maxLinearVel: 0.5
+    minLinearVel: 0.1

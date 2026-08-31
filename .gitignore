@@ -114,3 +114,8 @@ venv.bak/
 
 # logs
 phenobot_rl/dqnWeeding/logs/
+install/
+log/
+build/
+__pycache__/
+*.bak

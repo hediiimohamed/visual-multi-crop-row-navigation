@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.8)
+project(visual_multi_crop_row_navigation)
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+find_package(ament_cmake REQUIRED)        # <-- change from ament_cmake_python
+find_package(ament_cmake_python REQUIRED)
+find_package(rclpy REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(image_geometry REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(message_filters REQUIRED)
+
+ament_python_install_package(${PROJECT_NAME})
+
+# Install the entry-point scripts into lib/<pkg>/ so ROS can find them
+install(PROGRAMS
+  visual_multi_crop_row_navigation/vs_navigator.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME vs_navigator
+)
+
+install(DIRECTORY configs DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch  DESTINATION share/${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  find_package(ament_lint_auto REQUIRED)
+  ament_lint_auto_find_test_dependencies()
+endif()
+
+ament_package()

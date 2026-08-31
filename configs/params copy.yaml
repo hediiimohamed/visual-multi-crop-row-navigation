@@ -1,0 +1,55 @@
+/**:
+  ros__parameters:
+    # Camera topics - Simulation
+    frontColor_topic: "front/rgb/image_raw"
+    frontDepth_topic: "front/depth/image_raw"
+    frontCameraInfo_topic: "front/camera_info"
+    
+    backColor_topic: "back/rgb/image_raw"
+    backDepth_topic: "back/depth/image_raw"
+    backCameraInfo_topic: "back/camera_info"
+    
+    cmd_vel_topic: "/cmd_vel"
+
+    # Navigation mode
+    navigationMode: 1
+    stationaryDebug: false          # Mettre true pour tester sans mouvement
+    
+    # Scanner parameters
+    scanSteps: 30                  # Plus de fenêtres pour mieux couvrir
+    scanStartPoint: 80
+    scanEndPoint: 560
+    scanWindowWidth: 60            # Largeur de balayage
+
+    # Tracker parameters
+    trackingBoxWidth: 80           # Boîtes plus larges pour couvrir chaque groupe
+    sacleRatio: 1.0
+    topOffset: 50
+    bottomOffset: 50
+    # ROI parameters
+    enable_roi: false
+    p1: 0
+    p2: 0
+    p3: 0
+    p4: 0
+    p5: 0
+    p6: 0
+    p7: 0
+    p8: 0
+    
+    # Contour parameters
+    minContourArea: 40             # Détecter les petites plantes
+    imgResizeRatio: 1.0
+    
+    # Feature matching parameters
+    linesToPass: 5
+    minKeypointNum: 10
+    maxMatchingDifference: 50
+    minMatchingDifference: 10
+    
+    # Speed limits
+    omegaScaler: 1.0
+    maxOmega: 1.0
+    minOmega: 0.1
+    maxLinearVel: 0.5
+    minLinearVel: 0.1

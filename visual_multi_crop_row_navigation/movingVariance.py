@@ -1,4 +1,5 @@
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,6 +10,12 @@ import copy
 
 def movingStd(data, winSize=5):
     _data = data.copy()
+    
+    # Vérifier qu'il y a assez de données
+    if len(_data) <= winSize:
+        print(f"Warning: Not enough data points ({len(_data)}) for window size {winSize}")
+        return np.array([])
+    
     # compute a moving standard deviation
     stdVec = np.zeros((len(_data)-winSize, 1))
     for i in range(0, len(stdVec)):
@@ -19,11 +26,9 @@ def movingStd(data, winSize=5):
         stdVec[i] = np.sqrt(sqsum/(winSize))
 
     # normalize
-    stdVec = stdVec/max(stdVec)
+    if np.max(stdVec) > 0:
+        stdVec = stdVec/max(stdVec)
     stdVec = stdVec.reshape(len(stdVec),)
-    # print(repr(stdVec))
-    # plt.plot(stdVec)
-    # plt.show()
     return stdVec
 
 def findPicksTroughths(movVarM, prominence=0.5, height=None):

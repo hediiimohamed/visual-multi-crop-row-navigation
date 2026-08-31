@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 # Class to compute the control parameters 
 import numpy as np
 
@@ -65,4 +68,3 @@ def visualServoingCtl (camera, desiredState, actualState, v_des):
     temp = lambdavec * delta
     ang_fb = np.matmul(-Jac_ang_pi.T,(temp + Jac_vel * v_des))
     return ang_fb
-
