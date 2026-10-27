@@ -1,27 +1,43 @@
 /**:
   ros__parameters:
     # ==================== TOPICS ====================
-    frontColor_topic: "front/rgb/image_raw"
-    frontDepth_topic: "front/depth/image_raw"
-    frontCameraInfo_topic: "front/rgb/camera_info" 
-    backColor_topic: "back/rgb/image_raw"
-    backDepth_topic: "back/depth/image_raw"
-    backCameraInfo_topic: "back/camera_info"
+    # Eterry gen5 sim: visual_nav_camera (gen5_gz.urdf + gz_bridge.yaml), RGB only
+    frontColor_topic: "visual_nav_camera/rgb/image_raw"
+    frontDepth_topic: "visual_nav_camera/depth/image_raw"
+    frontCameraInfo_topic: "visual_nav_camera/rgb/camera_info"
+    # No back camera on Eterry: the "exit lane" stage (mode 2) reuses the front camera
+    backColor_topic: "visual_nav_camera/rgb/image_raw"
+    backDepth_topic: "visual_nav_camera/depth/image_raw"
+    backCameraInfo_topic: "visual_nav_camera/rgb/camera_info"
     cmd_vel_topic: "/cmd_vel"
-    
-    # ==================== PARAMÈTRES IMPORTANTS ====================
-    minContourArea: 150        # Augmenté pour filtrer plus de bruit
-    scanSteps: 45
-    scanStartPoint: 400        # Démarrer plus à droite
-    scanEndPoint: 1520         # Finir avant le bord
-    scanWindowWidth: 200       # Fenêtres plus larges
-    trackingBoxWidth: 280
-    topOffset: 180
-    bottomOffset: 180
+
+    # ==================== ROBOT (Eterry gen5) ====================
+    # visual_nav_camera_joint in gen5_gz.urdf: base_link + (2.25, -0.06, 0.40),
+    # pitched 0.96 rad down; base_link rests ~1.09 m above ground (measured in sim)
+    camera_height: 1.49
+    camera_tilt: -0.96
+    camera_forward_offset: 2.25    # ahead of base_link x=0 (zero lateral velocity line)
+    # carrier_controller: vx/wz only, |wz| <= |vx| / 1.2567 m (min turning radius)
+    linearVel: 0.2
+    exitLinearVel: 0.05
+    maxOmega: 0.15                 # ~ kinematic limit at 0.2 m/s
+    omegaScaler: 0.05              # 0.1 oscillates (+/-10 deg) with the steering lag
+    # Eterry cannot drive sideways (linear.y is ignored): stop at the row end
+    enable_row_switching: false
+
+    # ==================== IMAGE PROCESSING (960x540) ====================
+    # Scan range covers the bed under the robot only (neighbour beds are at x < 250)
+    minContourArea: 40
+    scanSteps: 30
+    scanStartPoint: 250
+    scanEndPoint: 850
+    scanWindowWidth: 60
+    trackingBoxWidth: 100
+    topOffset: 40
+    bottomOffset: 40
     sacleRatio: 0.8
     enable_roi: false
-    
-    # # ROI pour 1920x1080
+
     p1: [0, 0]
     p2: [0, 0]
     p3: [0, 0]
@@ -30,6 +46,6 @@
     p6: [0, 0]
     p7: [0, 0]
     p8: [0, 0]
-    
+
     # Debug
     stationaryDebug: false

@@ -8,7 +8,6 @@ from matplotlib import pyplot as plt
 import itertools
 
 from torch import zero_
-from cv_bridge import CvBridge
 
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
@@ -49,6 +48,12 @@ class imageProc:
         self.isInitialized = False
 
         self.cropRowEnd = False
+        # smallest gap between the rows found at initialization (merge detection)
+        self.initRowSpacing = 0.0
+        self.missedFrames = np.zeros(0, dtype=int)
+        # a row may be unseen this many frames in a row (~2 s at 30 Hz) before re-scanning
+        self.maxMissedFrames = 60
+        self.P, self.ang = None, None
 
         self.trackingBoxLoc = []
 
@@ -158,11 +163,14 @@ class imageProc:
             
             self.numOfCropRows = len(self.trackingBoxLoc)
             self.lostCropRows = list(np.zeros(self.numOfCropRows))
+            # consecutive frames each row was not seen (kept on its previous line)
+            self.missedFrames = np.zeros(self.numOfCropRows, dtype=int)
             # if there is any proper line to follow
             if self.numOfCropRows != 0:
                 # set parameters indicating a successfull initialization
                 self.isInitialized = True
                 self.cropLaneFound = True
+                self.initRowSpacing = self.minRowSpacing(self.CropRows)
                 print('#[INF] Controller Initialized - Crop Rows:',
                         len(self.CropRows),
                         ', Window positions:',
@@ -268,6 +276,14 @@ class imageProc:
         # counting the points in the top and bottom half
         self.pointsInBottom = 0
         self.pointsInTop = 0
+        # while tracking, each plant belongs only to the row whose previous line is
+        # closest: rows converge towards the top of the image, so neighbouring boxes
+        # overlap there and a shared plant pulls both lines together until they merge
+        nearestRow = None
+        if self.isInitialized and self.numPlantsInScene > 0:
+            rowX = (self.CropRows[:self.numOfCropRows, 1][:, None] * self.plantCenters2D[1][None, :]
+                    + self.CropRows[:self.numOfCropRows, 0][:, None])
+            nearestRow = np.argmin(np.abs(rowX - self.plantCenters2D[0][None, :]), axis=0)
         # for all windows
         for boxIdx in range(0, self.numOfCropRows, 1):
             # define window
@@ -286,6 +302,8 @@ class imageProc:
                 # checking #points in upper/lower half of the image
                 self.checkPlantsLocTB(self.plantCenters2D[:, ptIdx])
                 
+                if nearestRow is not None and nearestRow[ptIdx] != boxIdx:
+                    continue
                 # if plant center is inside tracking box
                 if self.rowTrackingBoxes[boxIdx].contains(Point(self.plantCenters2D[0, ptIdx], self.plantCenters2D[1, ptIdx])):
                     plantsInCropRow.append(self.plantCenters2D[:, ptIdx])
@@ -308,6 +326,15 @@ class imageProc:
                         trackingWindows[boxIdx] = self.scanFootSteps[boxIdx]
                     # mean x value of all points used for fitting the line
                     meanLinesInWindows[boxIdx] = np.median(plantsInCropRow, axis=0)[0]
+
+            if self.isInitialized:
+                if np.all(lines[boxIdx] == 0):
+                    # gap in this row (missing plants): keep its previous line for now
+                    self.missedFrames[boxIdx] += 1
+                    lines[boxIdx, :] = self.CropRows[boxIdx]
+                    meanLinesInWindows[boxIdx] = self.trackingBoxLoc[boxIdx] + self.trackerParams["trackingBoxWidth"]/2
+                else:
+                    self.missedFrames[boxIdx] = 0
 
         # if the feature extractor is initalized, adjust the window
         # size with the variance of the line fit
@@ -366,6 +393,15 @@ class imageProc:
                 (boxTL_x, boxT_y),
                 (boxTR_x, boxT_y)
             ])
+    def minRowSpacing(self, lines):
+        # smallest horizontal gap between two lines, at the top and bottom of the tracking boxes
+        if len(lines) < 2:
+            return np.inf
+        ends = np.c_[lineIntersectWin(lines[:, 1], lines[:, 0], self.imgHeight,
+                                      self.trackerParams["topOffset"],
+                                      self.trackerParams["bottomOffset"])]
+        return min(np.min(np.diff(np.sort(ends[:, 0]))), np.min(np.diff(np.sort(ends[:, 1]))))
+
     def checkPlantsInRows(self, cropRowID, plantsInCroRow):
 
         if len(plantsInCroRow) >= 2:
@@ -391,8 +427,28 @@ class imageProc:
             # get the lines at windows defined through previous found lines
             lines, linesROIs, meanLinesInWindows = self.findLinesInImage()
 
-            # if 'all' lines are found by 'self.getLinesInImage'
-            if len(lines) >= len(self.trackingBoxLoc):
+            # rows missing in this frame keep their previous line (gaps in a row);
+            # the lane is lost only when no row at all is seen, as at the end of the field
+            allRowsMissing = np.all(self.missedFrames > 0)
+            # previous lines too: a line squeezed out by its neighbour gets no plants
+            spacing = min(self.minRowSpacing(self.CropRows), self.minRowSpacing(lines))
+            merged = spacing < 0.5 * self.initRowSpacing
+            if not allRowsMissing and (merged or np.max(self.missedFrames) > self.maxMissedFrames):
+                # two lines collapsed onto the same row, or a row unseen for too long
+                # (its frozen line would bias the steering): scan the image again
+                if merged:
+                    print("#[ERR] Crop rows merged (spacing %.0f px, initially %.0f px): re-initializing"
+                          % (spacing, self.initRowSpacing))
+                else:
+                    print("#[ERR] A crop row was not seen for %d frames: re-initializing"
+                          % np.max(self.missedFrames))
+                self.isInitialized = False
+                self.cropLaneFound = False
+                self.updateTrackingBoxes()
+                self.numOfCropRows = len(self.rowTrackingBoxes)
+                return self.cropLaneFound, self.cropRowEnd, self.P, self.ang
+
+            if not allRowsMissing:
                 # the line parameters are the new tracked lines (for the next step)
                 self.CropRows = lines
                 # location is always the left side of the window
@@ -420,7 +476,7 @@ class imageProc:
                 self.cropLaneFound = True
 
             else:
-                print("#[ERR] Lost at least one line")
+                print("#[ERR] Lost all crop rows")
                 self.cropLaneFound = False
         else:
             print('Running rest()..')
@@ -490,7 +546,7 @@ class imageProc:
         # Vérifier si le masque est valide
         if mask is None or mask.size == 0 or np.max(mask) == 0:
             print("Warning: Empty mask detected, returning empty results")
-            return mask, greenIDX, [], np.array([])
+            return mask, greenIDX, [], np.zeros((2, 0))  # 2 x N like the plant centers
         
         # find contours
         plantObjects = getPlantMasks(

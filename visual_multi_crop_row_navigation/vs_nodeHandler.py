@@ -18,8 +18,10 @@ import tf2_ros
 import tf2_geometry_msgs
 import image_geometry
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Float64
-from cv_bridge import CvBridge, CvBridgeError
+from std_msgs.msg import Float64, Bool
+from std_srvs.srv import Trigger
+from rclpy.qos import QoSDurabilityPolicy
+from visual_multi_crop_row_navigation.imgConversion import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image, CameraInfo
 
 # Fixed imports - add package name
@@ -79,6 +81,16 @@ class vs_nodeHandler(Node):
         self.declare_parameter('minOmega', 0.01)
         self.declare_parameter('maxLinearVel', 0.5)
         self.declare_parameter('minLinearVel', 0.01)
+        # forward speed while tracking a row, and while no row is detected
+        self.declare_parameter('linearVel', 0.2)
+        self.declare_parameter('exitLinearVel', 0.05)
+        # camera mounting w.r.t. the robot (defaults: original phenobot values)
+        self.declare_parameter('camera_height', 1.0)            # m above ground
+        self.declare_parameter('camera_tilt', np.deg2rad(-80))  # rad, negative = pitched down
+        self.declare_parameter('camera_forward_offset', 0.0)    # m, camera ahead of the rotation centre
+        # false: stop at the end of the row instead of the lateral lane switch,
+        # for robots that cannot drive sideways (no linear.y)
+        self.declare_parameter('enable_row_switching', True)
 
         # Get parameter values
         self.frontColor_topic = self.get_parameter('frontColor_topic').value
@@ -135,6 +147,12 @@ class vs_nodeHandler(Node):
         cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
         self.velocity_pub = self.create_publisher(Twist, cmd_vel_topic, 1)
         print(f"[DEBUG] Publishing velocity to: {cmd_vel_topic}")
+
+        # hand-over to the headland / turning navigation: true once the row is finished
+        latched_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.row_end_pub = self.create_publisher(Bool, 'vs_nav/row_end', latched_qos)
+        self.row_end_pub.publish(Bool(data=False))
+        self.create_service(Trigger, 'vs_nav/start', self.start_callback)
 
         # settings
         self.navigationMode = self.get_parameter('navigationMode').value                   
@@ -197,7 +215,12 @@ class vs_nodeHandler(Node):
         self.minOmega = self.get_parameter('minOmega').value
         self.maxLinearVel = self.get_parameter('maxLinearVel').value
         self.minLinearVel = self.get_parameter('minLinearVel').value
-        
+        self.linearVel = self.get_parameter('linearVel').value
+        self.exitLinearVel = self.get_parameter('exitLinearVel').value
+        self.enableRowSwitching = self.get_parameter('enable_row_switching').value
+        # false once the row is finished: no more velocity commands until vs_nav/start
+        self.active = True
+
         # images
         self.frontImg = None
         self.frontDepth = None
@@ -213,7 +236,11 @@ class vs_nodeHandler(Node):
         self.imgWidth = 1920
 
         # camera
-        self.camera = cam.Camera(1,1.2,0,1,np.deg2rad(-80),0.96,0,0,1)
+        self.camera = cam.Camera(1, 1.2,
+                                 self.get_parameter('camera_forward_offset').value,
+                                 self.get_parameter('camera_height').value,
+                                 self.get_parameter('camera_tilt').value,
+                                 0.96, 0, 0, 1)
         self.imageProcessor = imc.imageProc(self.scannerParams,
                                             self.contourParams,
                                             self.rioParams,
@@ -286,6 +313,9 @@ class vs_nodeHandler(Node):
         
         if self.nav_counter % 100 == 1:  # Print every ~100 iterations
             print(f"[DEBUG] navigate() called - iteration {self.nav_counter}")
+
+        if not self.active:
+            return
         
         # Check if we have all required data (NO DEPTH REQUIRED!)
         if self.primaryCamera:
@@ -318,6 +348,9 @@ class vs_nodeHandler(Node):
             # this is only False if the initialization was unsuccessful
             if self.nav_counter % 50 == 1:
                 self.get_logger().warn("The initialization was unsuccessful!! ")
+            # rows lost while tracking, or no rows left while exiting: the row is done
+            if not self.enableRowSwitching and (self.imageProcessor.isInitialized or self.isExitingLane()):
+                self.finishRow("crop rows lost")
         else:
             if self.nav_counter % 100 == 1:
                 print("[DEBUG] findCropLane succeeded!")
@@ -345,6 +378,10 @@ class vs_nodeHandler(Node):
                         self.imageProcessor.isInitialized = False
                         self.imageProcessor.cropRowEnd = False
                         self.switchCamera()
+
+            elif self.isSwitchingLane() and not self.enableRowSwitching:
+                # the lane switch drives sideways, which this robot cannot do
+                self.finishRow("end of row")
 
             elif self.isSwitchingLane() and not self.samplingDone:
                 self.get_logger().info("Sampling the Lane!!")
@@ -428,6 +465,28 @@ class vs_nodeHandler(Node):
         self.velocity_pub.publish(self.velocityMsg)
         print("[DEBUG] Robot stopped")
 
+    def finishRow(self, reason):
+        # stop once, then leave cmd_vel to the turning navigation
+        self.setRobotVelocities(0.0, 0.0, 0.0)
+        self.active = False
+        self.row_end_pub.publish(Bool(data=True))
+        self.get_logger().info(f"Row finished ({reason}): robot stopped, waiting for vs_nav/start")
+
+    def start_callback(self, request, response):
+        # follow the next row from the beginning: forward, front camera
+        self.navigationMode = 1
+        self.linearMotionDir = 1
+        self.primaryCamera = True
+        self.samplingDone = False
+        self.imageProcessor.reset()
+        self.imageProcessor.isInitialized = False
+        self.imageProcessor.cropRowEnd = False
+        self.active = True
+        self.row_end_pub.publish(Bool(data=False))
+        self.get_logger().info("Row following started")
+        response.success = True
+        return response
+
     def updateNavigationStage(self):
         self.navigationMode += 1
         if self.navigationMode > 6:
@@ -484,7 +543,9 @@ class vs_nodeHandler(Node):
         if LaneFound:
             # define desired and actual feature vector
             desiredFeature = np.array([0.0, self.imgWidth/2, 0.0])
-            actualFeature = np.array([P[0], P[1], Angle])
+            # computeTheta measures from the image x axis (vertical row = -pi/2),
+            # the control law expects the angle to the image y axis (vertical row = 0)
+            actualFeature = np.array([P[0], P[1], visualServoingCtl.wrapToPi(Angle + np.pi/2)])
             # compute controls
             controls = visualServoingCtl.visualServoingCtl(self.camera,
                                                 desiredFeature, 
@@ -494,10 +555,11 @@ class vs_nodeHandler(Node):
                 self.rotationDir = -1
             else:
                 self.rotationDir = 1
-            # scale rotational velocity 
-            omega = self.omegaScaler * controls 
+            # scale rotational velocity
+            omega = float(np.clip(self.omegaScaler * np.squeeze(controls),
+                                  -self.maxOmega, self.maxOmega))
             # set linear speed and direction
-            rho = 0.2 * self.linearMotionDir
+            rho = self.linearVel * self.linearMotionDir
             # store the command in a cache
             self.omegaBuffer.append(omega)
             
@@ -508,7 +570,7 @@ class vs_nodeHandler(Node):
                 self.omegaBuffer.append(0.0)
             # straight exit
             omega = 0.0
-            rho = 0.05 * self.linearMotionDir
+            rho = self.exitLinearVel * self.linearMotionDir
             return [rho, omega] 
 
     def transformTargets(self, targets, frameName):
