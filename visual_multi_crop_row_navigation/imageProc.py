@@ -1,13 +1,8 @@
  #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import scipy
 import cv2 as cv
 import numpy as np
-from matplotlib import pyplot as plt
-import itertools
-
-from torch import zero_
 
 from shapely.geometry import Point
 from shapely.geometry.polygon import Polygon
@@ -31,11 +26,31 @@ class imageProc:
         self.contourParams = contourParams
         self.scannerParams = scannerParams
         self.trackerParams = trackerParams
+        # rows the image scan must find to start tracking (a lane center needs 2)
+        self.minRows = trackerParams.get("minRows", 1)
+        self.verbose = True
+        # ground-plane row tracker (groundTracker.RowTracker), set by the node;
+        # without it the rows are tracked in the image only
+        self.groundTracker = None
+        # robot pose (x, y, yaw) in the odom frame for the current image
+        self.robotPose = None
+        # past the last plants of the row: the ground tracker follows the lane by odometry
+        self.exiting = False
 
         self.reset()
 
+    def log(self, *args):
+        if self.verbose:
+            print(*args)
+
     def reset(self):
-        print("**************Reset*************")
+        self.log("**************Reset*************")
+        if getattr(self, 'groundTracker', None) is not None:
+            self.groundTracker.reset()
+        # true when the ground tracker lost the lane (not when the initial scan fails)
+        self.trackingLost = False
+        self.trackStatus = ''
+        self.rowPixels = []
         self.count = 0
         self.pointsInTop = 0
         self.pointsInBottom = 0
@@ -100,18 +115,42 @@ class imageProc:
         
         # check if current image is not Empty or None
         if self.primaryRGBImg is None or len(self.primaryRGBImg) == 0:
-            print("#[ERR] CR-Scanner - Image is None, Check Topics or the Sensor !")
+            self.log("#[ERR] CR-Scanner - Image is None, Check Topics or the Sensor !")
         else:
             # initial RGB image process to get mask GreenIDx and plant centers
+            self.plantWidths2D = None
             self.mask, self.greenIDX, self.plantObjects2D, self.plantCenters2D = self.processRGBImage(self.primaryRGBImg)
             self.numPlantsInScene = len(self.plantCenters2D[0])
-        if not self.isInitialized:
-            print("#[INF] Find Crop Lane")
+        if not self.isInitialized and self.groundTracker is not None:
+            self.findCropRowsGround()
+        elif not self.isInitialized:
+            self.log("#[INF] Find Crop Lane")
+            self.trackStatus = 'scan: no crop rows found'
             self.lines2D, self.linesROIs2D = self.findCropRows2D(self.primaryRGBImg)
             # self.lines3D, self.linesROIs3D = self.findCropRows3D(self.mask, self.plantCenters2D, self.primaryDepthImg)
             # merge both predictions to get more robust results!
 
         return self.cropLaneFound
+
+    def findCropRowsGround(self):
+        """initialize the ground tracker with the plants between scanStartPoint and scanEndPoint"""
+        tracker = self.groundTracker
+        u, v = self.plantCenters2D
+        inScan = (u >= self.scannerParams["scanStartPoint"]) & (u <= self.scannerParams["scanEndPoint"])
+        xNear, xFar = tracker.viewRange(self.imgHeight, self.trackerParams["topOffset"])
+        widths = self.plantWidths2D[inScan] if self.plantWidths2D is not None else None
+        self.cropLaneFound = tracker.initialize(np.c_[u[inScan], v[inScan]], self.robotPose, xNear, widths)
+        self.trackStatus = tracker.status
+        if not self.cropLaneFound:
+            self.log('#[INF] Find Crop Lane: ' + tracker.status)
+            return
+        rows, center = tracker.rowLines(self.robotPose, xNear)
+        self.CropRows = np.array([tracker.lineToImage(a - b * xNear, b, xNear, xFar) for a, b in rows])
+        self.numOfCropRows = len(self.CropRows)
+        self.trackingBoxLoc = np.zeros((self.numOfCropRows, 1))
+        self.missedFrames = np.zeros(self.numOfCropRows, dtype=int)
+        self.isInitialized = True
+        self.log('#[INF] Controller Initialized - ' + tracker.status)
 
     def findCropRows3D(self, maskImg, plantCenters2D, depthImg):
         if depthImg is None:
@@ -130,13 +169,13 @@ class imageProc:
         lines, linesROIs, _ = self.findLinesInImage()
         # if any feature is observed during the scan
         if len(lines) != 0:
-            print(f"DEBUG: lines found: {len(lines)}")
-            print(f"DEBUG: lines X positions: {[line[0] for line in lines[:10]]}")
+            self.log(f"DEBUG: lines found: {len(lines)}")
+            self.log(f"DEBUG: lines X positions: {[line[0] for line in lines[:10]]}")
             np.set_printoptions(suppress=True)
             
             # Vérifier qu'il y a assez de lignes pour calculer la moving std
             if len(lines[:, 0]) <= 5:
-                print('--- Initialisation failed - Not enough lines for analysis ---')
+                self.log('--- Initialisation failed - Not enough lines for analysis ---')
                 self.cropLaneFound = False
                 return lines, linesROIs
             
@@ -145,7 +184,7 @@ class imageProc:
             
             # Vérifier que mvSignal n'est pas vide
             if len(mvSignal) == 0:
-                print('--- Initialisation failed - Moving std returned empty ---')
+                self.log('--- Initialisation failed - Moving std returned empty ---')
                 self.cropLaneFound = False
                 return lines, linesROIs
             
@@ -157,7 +196,7 @@ class imageProc:
             
             # Ajouter cette vérification
             if len(self.CropRows) == 0 or len(self.trackingBoxLoc) == 0:
-                print('--- Initialisation failed - No valid crop rows found ---')
+                self.log('--- Initialisation failed - No valid crop rows found ---')
                 self.cropLaneFound = False
                 return lines, linesROIs
             
@@ -166,21 +205,26 @@ class imageProc:
             # consecutive frames each row was not seen (kept on its previous line)
             self.missedFrames = np.zeros(self.numOfCropRows, dtype=int)
             # if there is any proper line to follow
-            if self.numOfCropRows != 0:
+            if self.numOfCropRows < self.minRows:
+                self.log('--- Initialisation failed - %d crop row(s) found, %d needed ---'
+                         % (self.numOfCropRows, self.minRows))
+                self.cropLaneFound = False
+                self.trackStatus = 'scan: %d row(s) found, %d needed' % (self.numOfCropRows, self.minRows)
+            elif self.numOfCropRows != 0:
                 # set parameters indicating a successfull initialization
                 self.isInitialized = True
                 self.cropLaneFound = True
                 self.initRowSpacing = self.minRowSpacing(self.CropRows)
-                print('#[INF] Controller Initialized - Crop Rows:',
+                self.log('#[INF] Controller Initialized - Crop Rows:',
                         len(self.CropRows),
                         ', Window positions:',
                         self.CropRows[:,0].tolist())
             else:
-                print(
+                self.log(
                     '--- Initialisation failed - No lines detected due to peak detection ---')
                 self.cropLaneFound = False
         else:
-            print(
+            self.log(
                 '--- Initialisation failed - No lines detected by sweeping window ---')
             self.cropLaneFound = False
         return lines, linesROIs
@@ -284,6 +328,7 @@ class imageProc:
             rowX = (self.CropRows[:self.numOfCropRows, 1][:, None] * self.plantCenters2D[1][None, :]
                     + self.CropRows[:self.numOfCropRows, 0][:, None])
             nearestRow = np.argmin(np.abs(rowX - self.plantCenters2D[0][None, :]), axis=0)
+        self.rowPixels = []
         # for all windows
         for boxIdx in range(0, self.numOfCropRows, 1):
             # define window
@@ -307,6 +352,7 @@ class imageProc:
                 # if plant center is inside tracking box
                 if self.rowTrackingBoxes[boxIdx].contains(Point(self.plantCenters2D[0, ptIdx], self.plantCenters2D[1, ptIdx])):
                     plantsInCropRow.append(self.plantCenters2D[:, ptIdx])
+            self.rowPixels.append(plantsInCropRow)
 
             if len(plantsInCropRow) >= 2:
                 # flipped points
@@ -315,7 +361,7 @@ class imageProc:
                 xM, xB = getLineRphi(ptsFlip)
                 t_i, b_i = lineIntersectImgUpDown(xM, xB, self.imgHeight)
                 l_i, r_i = lineIntersectImgSides(xM, xB, self.imgHeight)
-                # print("row ID:", boxIdx, t_i, b_i, l_i, r_i )
+                # self.log("row ID:", boxIdx, t_i, b_i, l_i, r_i )
                 # if the linefit does not return None and the line-image intersections
                 # are within the image bounds
                 if xM is not None and b_i >= 0 and b_i <= self.imgWidth:
@@ -421,6 +467,8 @@ class imageProc:
         Returns:
             _type_: _description_
         """
+        if self.groundTracker is not None:
+            return self.trackCropLaneGround(mode)
         P, ang = None, None
         # if the feature extractor is initalized
         if self.cropLaneFound:
@@ -437,10 +485,10 @@ class imageProc:
                 # two lines collapsed onto the same row, or a row unseen for too long
                 # (its frozen line would bias the steering): scan the image again
                 if merged:
-                    print("#[ERR] Crop rows merged (spacing %.0f px, initially %.0f px): re-initializing"
+                    self.log("#[ERR] Crop rows merged (spacing %.0f px, initially %.0f px): re-initializing"
                           % (spacing, self.initRowSpacing))
                 else:
-                    print("#[ERR] A crop row was not seen for %d frames: re-initializing"
+                    self.log("#[ERR] A crop row was not seen for %d frames: re-initializing"
                           % np.max(self.missedFrames))
                 self.isInitialized = False
                 self.cropLaneFound = False
@@ -476,14 +524,18 @@ class imageProc:
                 self.cropLaneFound = True
 
             else:
-                print("#[ERR] Lost all crop rows")
+                self.log("#[ERR] Lost all crop rows")
                 self.cropLaneFound = False
         else:
-            print('Running rest()..')
+            self.log('Running rest()..')
         
         if self.pointsInBottom == 0 and self.pointsInTop == 0:
             self.cropLaneFound = False
 
+        self.checkRowEnd(mode)
+        return self.cropLaneFound, self.cropRowEnd, self.P, self.ang
+
+    def checkRowEnd(self, mode):
         if self.pointsInBottom == 0 and mode in [2, 5]:
             self.cropRowEnd = True
         elif self.pointsInTop == 0 and mode in [1, 4]:
@@ -491,7 +543,56 @@ class imageProc:
         else:
             self.cropRowEnd = False
 
+    def trackCropLaneGround(self, mode=None):
+        """track the rows on the ground plane: line fit on the last plants of each row,
+        metric plausibility checks (see groundTracker.RowTracker)"""
+        tracker = self.groundTracker
+        self.trackingLost = False
+        if not self.cropLaneFound:
+            return self.cropLaneFound, self.cropRowEnd, self.P, self.ang
+        # plants of each row, inside the boxes around the previous lines
+        self.findLinesInImage()
+        xNear, xFar = tracker.viewRange(self.imgHeight, self.trackerParams["topOffset"])
+        # lateral error and limits are measured at the bottom of the image
+        xRef = xNear
+        if not tracker.initialized:
+            # tracker reset since the rows were found: find them again
+            self.isInitialized = False
+            self.cropLaneFound = False
+            return self.cropLaneFound, self.cropRowEnd, self.P, self.ang
+        # plants of the rows in the far half of the view: the row goes on
+        xAhead = (xNear + xFar) / 2
+        if not tracker.update(self.rowPixels, self.robotPose, xRef, xNear, xAhead, self.exiting):
+            self.trackStatus = tracker.status
+            self.log('#[ERR] ' + tracker.status)
+            self.cropLaneFound = False
+            self.trackingLost = True
+            return self.cropLaneFound, self.cropRowEnd, self.P, self.ang
+        self.trackStatus = tracker.status
+
+        # ground lines back into the image: tracking boxes, drawing and visual servoing
+        rows, center = tracker.rowLines(self.robotPose, xRef)
+        self.CropRows = np.array([tracker.lineToImage(a - b * xRef, b, xNear, xFar) for a, b in rows])
+        self.numOfCropRows = len(self.CropRows)
+        c, m = tracker.lineToImage(center[0] - center[1] * xRef, center[1], xNear, xFar)
+        # same features as the image tracker, from the lane center line
+        avgOfLines = [m * self.imgHeight + c, c]
+        self.mainLine_up, self.mainLine_down = getImgLineUpDown(avgOfLines, self.imgHeight)
+        allLineIntersect = np.c_[lineIntersectWin(self.CropRows[:, 1], self.CropRows[:, 0], self.imgHeight,
+                                                  self.trackerParams["topOffset"],
+                                                  self.trackerParams["bottomOffset"])]
+        self.allLineStart = np.c_[allLineIntersect[:, 0],
+                                  self.imgHeight - self.trackerParams["bottomOffset"] * np.ones((len(self.CropRows), 1))]
+        self.allLineEnd = np.c_[allLineIntersect[:, 1],
+                                self.trackerParams["topOffset"] * np.ones((len(self.CropRows), 1))]
+        self.P = self.cameraToImage([avgOfLines[1], self.imgHeight])
+        self.ang = computeTheta(self.mainLine_up, self.mainLine_down)
+        self.cropLaneFound = True
+        # end of row: no plant of the tracked rows ahead any more (weeds or neighbour beds
+        # in the top of the image do not count, unlike checkRowEnd)
+        self.cropRowEnd = tracker.rowEnd()
         return self.cropLaneFound, self.cropRowEnd, self.P, self.ang
+
     def cameraToImage(self, P):
         """function to transform the feature point from camera to image frame
         Args:
@@ -527,9 +628,9 @@ class imageProc:
         Returns:
             _type_: _description_
         """
-        print("\n" + "="*60)
-        print(">>> PROCESS RGB IMAGE IS RUNNING (SOURCE FILE VERSION) <<<")
-        print("="*60 + "\n")
+        self.log("\n" + "="*60)
+        self.log(">>> PROCESS RGB IMAGE IS RUNNING (SOURCE FILE VERSION) <<<")
+        self.log("="*60 + "\n")
         # change datatype to enable negative values for self.greenIDX calculation
         rgbImg = rgbImg.astype('int32')
         
@@ -545,40 +646,75 @@ class imageProc:
             
         # Vérifier si le masque est valide
         if mask is None or mask.size == 0 or np.max(mask) == 0:
-            print("Warning: Empty mask detected, returning empty results")
+            self.log("Warning: Empty mask detected, returning empty results")
             return mask, greenIDX, [], np.zeros((2, 0))  # 2 x N like the plant centers
         
+        if self.contourParams.get("pointExtraction", "contours") == "bands":
+            # contours are only drawn; the points come from horizontal bands of the mask
+            plantObjects = getPlantMasks(mask, self.contourParams["minContourArea"], maxSize=None)
+            points = self.getBandPoints(mask)
+            return mask, greenIDX, plantObjects, points
+
         # find contours
         plantObjects = getPlantMasks(
             mask, self.contourParams["minContourArea"], bushy=False)
         
-        print(f"Number of plant objects found: {len(plantObjects)}")
+        self.log(f"Number of plant objects found: {len(plantObjects)}")
     
         # Afficher la taille des 10 premiers contours
         for i, cnt in enumerate(plantObjects[:10]):
             area = cv.contourArea(cnt)
             x, y, w, h = cv.boundingRect(cnt)
-            print(f"  Contour {i}: area={area:.0f}, bbox=({x},{y},{w},{h})")
+            self.log(f"  Contour {i}: area={area:.0f}, bbox=({x},{y},{w},{h})")
         
         # get center of contours
         if len(plantObjects) == 0:
-            print("No plant objects found")
-            return mask, greenIDX, plantObjects, np.array([])
+            self.log("No plant objects found")
+            return mask, greenIDX, plantObjects, np.zeros((2, 0))
         
         contCenterPTS = getContourCenter(plantObjects)
         
         if len(contCenterPTS) == 0:
-            return mask, greenIDX, plantObjects, np.array([])
+            return mask, greenIDX, plantObjects, np.zeros((2, 0))
         
         x = contCenterPTS[:, 1]
         y = contCenterPTS[:, 0]
         
         return mask, greenIDX, plantObjects, np.array([x, y])
 
+    def getBandPoints(self, mask):
+        """row points from the mask, independent of how the plants are separated: the image
+        is cut in horizontal bands and each run of vegetation columns in a band gives one
+        point. Touching plants or a continuous row (one big contour) give many points along
+        the row instead of one center or none."""
+        h, w = mask.shape[:2]
+        band = max(int(self.contourParams.get("bandHeight", 12)), 2)
+        minRun = max(int(self.contourParams.get("minRunWidth", 3)), 1)
+        maxRun = int(self.contourParams.get("maxRunWidth", 0)) or w // 4
+        fill = self.contourParams.get("bandFill", 0.3)
+        xs, ys, ws = [], [], []
+        binary = (mask > 0)
+        for top in range(0, h - band + 1, band):
+            # columns of this band with enough vegetation
+            cols = np.count_nonzero(binary[top:top + band], axis=0) >= fill * band
+            if not cols.any():
+                continue
+            edges = np.flatnonzero(np.diff(np.r_[0, cols.astype(np.int8), 0]))
+            starts, ends = edges[0::2], edges[1::2]
+            width = ends - starts
+            # wider runs are several rows merged (far away) or a weed patch: not a row point
+            ok = (width >= minRun) & (width <= maxRun)
+            xs.extend(((starts[ok] + ends[ok] - 1) / 2.0).tolist())
+            ys.extend([top + band / 2.0] * int(np.count_nonzero(ok)))
+            ws.extend(width[ok].tolist())
+        # vegetation width (pixels) of each point: weighs crop rows against small weeds
+        self.plantWidths2D = np.array(ws, dtype=float)
+        return np.array([xs, ys], dtype=float).reshape(2, -1)
+
     def getExgMask(self, img):
         """Function to compute the green index of the image
         """
-        print(f"DEBUG getExgMask: img shape={img.shape}, dtype={img.dtype}")
+        self.log(f"DEBUG getExgMask: img shape={img.shape}, dtype={img.dtype}")
         
         _img = img.copy()
         _img = _img.astype('int32')
@@ -588,25 +724,36 @@ class imageProc:
         g = _img[:, :, 1]
         b = _img[:, :, 2]
 
-        # calculate Excess Green Index
+        # calculate Excess Green Index (symmetric in r and b: BGR or RGB order does not matter)
         greenIDX = 2*g - r - b
-        greenIDX[greenIDX < 0] = 0
-        greenIDX = greenIDX.astype('uint8')
+        if self.contourParams.get("exgNormalized", False):
+            # chromatic ExG = (2G-R-B)/(R+G+B): independent of the brightness, so leaves in
+            # the robot's shadow and in full sun get the same value; too dark pixels are noise
+            total = r + g + b
+            greenIDX = np.where(total > 3 * self.contourParams.get("exgDarkLevel", 20),
+                                255.0 * greenIDX / np.maximum(total, 1), 0)
+        # clip, not wrap: a bright leaf (ExG 360) must not become 104 in uint8
+        greenIDX = np.clip(greenIDX, 0, 255).astype('uint8')
         
-        print(f"DEBUG: greenIDX shape={greenIDX.shape}, min={greenIDX.min()}, max={greenIDX.max()}")
+        self.log(f"DEBUG: greenIDX shape={greenIDX.shape}, min={greenIDX.min()}, max={greenIDX.max()}")
 
         # Otsu's thresholding after gaussian smoothing
         blur = cv.GaussianBlur(greenIDX, (5, 5), 0)
         threshold, threshIMG = cv.threshold(
             blur, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+        # Otsu always splits the image in two: on bare soil it would turn soil noise into
+        # plants, so the threshold never goes below a minimal green level
+        exgMin = self.contourParams.get("exgMin", 0.0) * 255
+        if threshold < exgMin:
+            threshold, threshIMG = cv.threshold(blur, exgMin, 255, cv.THRESH_BINARY)
         
-        print(f"DEBUG: Otsu threshold={threshold}, threshIMG max={threshIMG.max()}")
+        self.log(f"DEBUG: Otsu threshold={threshold}, threshIMG max={threshIMG.max()}")
 
         # CORRECTION: Dilatation beaucoup plus petite
         kernel = np.ones((3, 3), np.uint8)
         binaryMask = cv.dilate(threshIMG, kernel, iterations=1)
         
-        print(f"DEBUG: binaryMask shape={binaryMask.shape}, non-zero pixels={np.count_nonzero(binaryMask)}")
+        self.log(f"DEBUG: binaryMask shape={binaryMask.shape}, non-zero pixels={np.count_nonzero(binaryMask)}")
 
         return binaryMask, greenIDX
 
@@ -626,7 +773,7 @@ class imageProc:
                 if len(l_pts) >= 3 and all(isinstance(p, (list, tuple)) for p in l_pts):
                     cv.fillPoly(_img, np.array([l_pts], dtype=np.int32), (0, 0, 0))
             except Exception as e:
-                print(f"Error in applyROI: {e}")
+                self.log(f"Error in applyROI: {e}")
                 pass
         return _img
 
@@ -669,7 +816,7 @@ class imageProc:
                     self.graphicsImg = cv.circle(
                         self.graphicsImg, (x, y), 3, (255, 0, 255), 5)
         else:
-            print("No primaryRGBImg to draw")
+            self.log("No primaryRGBImg to draw")
 
     def handleKey(self, sleepTime=0):
         key = cv.waitKey(sleepTime)

@@ -31,7 +31,8 @@ def getContourCenter(contours):
         contCenterPTS = contCenterPTS[~np.all(contCenterPTS == 0, axis=1)]
         return contCenterPTS
 
-def getPlantMasks(binrayMask, min_contour_area, bushy=False):
+def getPlantMasks(binrayMask, min_contour_area, bushy=False, maxSize=(250, 350)):
+    """maxSize: (width, height) in pixels above which a contour is dropped, None: keep all"""
     # Vérifier que le masque est valide
     if binrayMask is None:
         return []
@@ -65,13 +66,14 @@ def getPlantMasks(binrayMask, min_contour_area, bushy=False):
             # CORRECTION: Filtrer par bounding box
             x, y, w, h = cv.boundingRect(contour)
             
-            # Rejeter les très gros blobs parasites
-            if w > 250 or h > 350:
-                continue
-            
-            # Rejeter les zones trop horizontales / trop étalées
-            if h > 0 and (w / float(h)) > 3.0:
-                continue
+            if maxSize is not None:
+                # Rejeter les très gros blobs parasites
+                if w > maxSize[0] or h > maxSize[1]:
+                    continue
+
+                # Rejeter les zones trop horizontales / trop étalées
+                if h > 0 and (w / float(h)) > 3.0:
+                    continue
             
             filtered_contours.append(contour)
             

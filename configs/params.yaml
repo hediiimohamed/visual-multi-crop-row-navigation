@@ -12,25 +12,41 @@
     cmd_vel_topic: "/cmd_vel"
 
     # ==================== ROBOT (Eterry gen5) ====================
-    # visual_nav_camera_joint in gen5_gz.urdf: base_link + (2.25, -0.06, 0.40),
-    # pitched 0.96 rad down; base_link rests ~1.09 m above ground (measured in sim)
-    camera_height: 1.49
-    camera_tilt: -0.96
-    camera_forward_offset: 2.25    # ahead of base_link x=0 (zero lateral velocity line)
+    # visual_nav_camera_joint in gen5_gz.urdf: on the ZED 2i mount in the middle of the robot,
+    # base_link + (0.13, 0.135, 0.168), pitched 0.60 rad down;
+    # base_link rests ~1.09 m above ground (measured in sim)
+    camera_height: 1.258
+    camera_tilt: -0.60
+    camera_forward_offset: 0.13    # ahead of base_link x=0 (zero lateral velocity line)
+    camera_lateral_offset: 0.135   # left of base_link (negative: right), ~0.2 m left of the bed centre
+    # plant centers are detected on the canopy, not on the ground (sim beans: 0.2 m +/-40 %)
+    crop_plane_height: 0.12
+    camera_yaw: 0.0                # rad (> 0: camera turned left)
+    camera_roll: 0.0               # rad, mounting error (> 0: right side down)
     # carrier_controller: vx/wz only, |wz| <= |vx| / 1.2567 m (min turning radius)
     linearVel: 0.2
     exitLinearVel: 0.05
     maxOmega: 0.15                 # ~ kinematic limit at 0.2 m/s
-    omegaScaler: 0.05              # 0.1 oscillates (+/-10 deg) with the steering lag
+    omegaScaler: 0.03              # visual_servo only, needs a camera above the lane centre
+    # steering: pure_pursuit on the lane center line (metres), or visual_servo (previous)
+    controller: "pure_pursuit"
+    lookahead_distance: 2.5        # m; shorter: tighter but oscillates with the steering lag
+    lane_offset: 0.06              # m, base_link left of the lane center (sim: swath 6 cm left of the bed)
     # Eterry cannot drive sideways (linear.y is ignored): stop at the row end
     enable_row_switching: false
 
     # ==================== IMAGE PROCESSING (960x540) ====================
-    # Scan range covers the bed under the robot only (neighbour beds are at x < 250)
+    processing_width: 0            # downscale wider images first (e.g. 960 for a 1920 ZED); 0: off
+    # all pixel values below refer to the processed image
+    point_extraction: "bands"      # one point per vegetation run in each band (continuous rows ok)
+    band_height: 12                # px
+    exg_normalized: true           # brightness independent green index (shadows, sun)
+    exg_min: 0.1                   # minimal green level 0..1: bare soil gives no plant
+    # Plants between scanStartPoint and scanEndPoint (image columns) are used to find the rows
     minContourArea: 40
     scanSteps: 30
-    scanStartPoint: 250
-    scanEndPoint: 850
+    scanStartPoint: 330            # bed rows at u~410..710 near, neighbour beds at u~270 and ~860
+    scanEndPoint: 790
     scanWindowWidth: 60
     trackingBoxWidth: 100
     topOffset: 40
@@ -47,5 +63,41 @@
     p7: [0, 0]
     p8: [0, 0]
 
+    # ==================== GROUND ROW TRACKING ====================
+    # Plant centers projected on the ground (odom frame), each row fitted on its last
+    # plants, every estimate checked in metres
+    odom_frame: "odom"
+    base_frame: "base_link"
+    min_rows: 2                    # rows needed to compute the lane center
+    furrow_width: 0.0              # m between two rows; 0: measured from the rows found at start
+    furrow_tolerance: 0.25         # row spacing must be within +/-25 % of the furrow width
+    max_furrow_width: 1.2          # m, longest row spacing searched when measuring it
+    lane_rows: 3                   # rows of one bed (sim: 3); 0: all evenly spaced rows found
+    init_confirm_frames: 3         # the same lane must be found in 3 images before driving
+    history_size: 100              # last plant centers kept per row
+    history_length: 3.0            # m of history kept behind the camera view
+    max_lateral_jump: 0.05         # m, larger change between two images is rejected
+    max_lateral_error: 0.0         # m, 0: furrow_width / 2
+    max_heading_error: 15.0        # deg
+    max_bad_frames: 5              # rejected images in a row -> rows lost
+    max_row_gap: 1.0               # m driven without seeing a row -> that row is not used
+    # end of row: no row plant ahead in row_end_frames images -> EXIT: drive on along the lane
+    # (odometry) until base_link is row_end_offset past the last plant, then vs_nav/row_end
+    row_end_frames: 5
+    row_end_distance: 0.5          # m driven without plants ahead, as well
+    row_end_offset: 0.0            # m (e.g. tool behind base_link: its distance, negative ahead)
+
+    # ==================== RECOVERY (rows lost) ====================
+    # stop, scan recovery_scan_time; if no rows, drive recovery_step forward and scan again;
+    # nothing after recovery_max_distance -> FAILED (stopped until vs_nav/start)
+    recovery_scan_time: 1.0        # s
+    recovery_step: 0.10            # m
+    recovery_max_distance: 1.0     # m
+
+    # ==================== WATCHDOGS ====================
+    image_timeout: 0.5             # s without a new camera image -> stop
+    max_omega_rate: 0.5            # rad/s^2, limit on the steering command change
+
     # Debug
+    verbose: false                 # per-image debug output (costs CPU)
     stationaryDebug: false

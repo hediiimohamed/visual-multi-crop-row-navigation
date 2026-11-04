@@ -27,6 +27,7 @@ setup(
     entry_points={
         'console_scripts': [
             'vs_navigator = visual_multi_crop_row_navigation.vs_navigator:main',
+            'row_follow_eval = visual_multi_crop_row_navigation.row_follow_eval:main',
         ],
     },
 )
