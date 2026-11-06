@@ -128,10 +128,11 @@ class RowTracker:
         # lane of this row (row offsets, furrow, last center in odom), kept across a recovery
         # so that the rows found again are matched to the same lane
         if getattr(self, 'initialized', False):
-            self.lane = (list(self.offsets), self.furrowWidth, self.centerOdom)
+            self.lane = (list(self.laneOffsets), self.furrowWidth, self.centerOdom)
         self.initialized = False
         self.rows = []              # per row: {'pts': N x 4 [x_odom, y_odom, weight, odometer seen]}
         self.offsets = []           # lateral position of each row w.r.t. the lane center
+        self.laneOffsets = []       # all rows of the lane (also those not found again after a loss)
         self.furrowWidth = None
         self.odometer = 0.0
         self.lastPose = None
@@ -210,8 +211,18 @@ class RowTracker:
         widths: vegetation width (pixels) at each point, wide rows outweigh small weeds.
         True once the same lane was found in initConfirmFrames images in a row."""
         if not self._findLane(pixels, pose, xRef, widths):
-            self.candidates = []
-            return False
+            if self.lane is None or self.p.get('laneRows', 0) <= 0:
+                self.candidates = []
+                return False
+            # the rows do not fit the lane followed before (its position comes from the
+            # odometry, extrapolated over the recovery): a whole lane of laneRows rows around
+            # the robot (it is still within half a furrow of its center) is the same one
+            memory, reason = self.lane, self.status
+            self.lane = None
+            if not self._findLane(pixels, pose, xRef, widths):
+                self.lane, self.status = memory, reason
+                self.candidates = []
+                return False
         # confirmation: same rows (odom), same furrow, in consecutive images
         lane = (self.centerOdom, len(self.rows), self.furrowWidth)
         if self.candidates:
@@ -358,6 +369,7 @@ class RowTracker:
         self.furrowWidth = furrow
         self.rows = rows
         self.offsets = list(offsets)
+        self.laneOffsets = list(self.lane[0]) if self.lane is not None else list(offsets)
         self._setCenter(center, slope, pose, xRef)
         self.curvature = bend
         self.badFrames = 0
@@ -379,9 +391,13 @@ class RowTracker:
                 continue
             center = np.mean([lat[j] - pattern[i] for j, i in pairs])
             err = abs(center - predicted)
-            if best is None or err < best[0] - 1e-6 or (abs(err - best[0]) < 1e-6 and len(pairs) > len(best[1])):
+            if err > furrow / 2:
+                continue
+            # as many rows of the lane as possible, then the center closest to the prediction
+            # (a 2-row match shifted by one row can be closer to a drifted prediction)
+            if best is None or len(pairs) > len(best[1]) or (len(pairs) == len(best[1]) and err < best[0]):
                 best = (err, pairs)
-        if best is None or best[0] > furrow / 2:
+        if best is None:
             return None
         return [j for j, _ in best[1]], [pattern[i] for _, i in best[1]], furrow
 
