@@ -110,6 +110,9 @@ class vs_nodeHandler(Node):
         self.declare_parameter('band_height', 12)               # px, one row point per band
         self.declare_parameter('exg_normalized', True)          # brightness independent green index
         self.declare_parameter('exg_min', 0.1)                  # minimal green level (0..1), bare soil
+        self.declare_parameter('exg_blur', 5)                   # px, gaussian blur before the threshold (0: none)
+        self.declare_parameter('min_run_width', 3)              # px, narrowest vegetation run giving a point
+        self.declare_parameter('band_fill', 0.3)                # share of a band's height a column must be green
         # steering: 'pure_pursuit' on the lane center (metres) or 'visual_servo' (previous)
         self.declare_parameter('controller', 'pure_pursuit')
         self.declare_parameter('lookahead_distance', 2.5)       # m, pure pursuit
@@ -261,6 +264,9 @@ class vs_nodeHandler(Node):
             "bandHeight": self.get_parameter('band_height').value,
             "exgNormalized": self.get_parameter('exg_normalized').value,
             "exgMin": self.get_parameter('exg_min').value,
+            "exgBlur": self.get_parameter('exg_blur').value,
+            "minRunWidth": self.get_parameter('min_run_width').value,
+            "bandFill": self.get_parameter('band_fill').value,
         }
 
         self.featureParams = {

@@ -737,8 +737,10 @@ class imageProc:
         
         self.log(f"DEBUG: greenIDX shape={greenIDX.shape}, min={greenIDX.min()}, max={greenIDX.max()}")
 
-        # Otsu's thresholding after gaussian smoothing
-        blur = cv.GaussianBlur(greenIDX, (5, 5), 0)
+        # Otsu's thresholding after gaussian smoothing (none for seedlings of 1-3 pixels: the
+        # blur spreads them into the soil below the threshold)
+        k = int(self.contourParams.get("exgBlur", 5))
+        blur = cv.GaussianBlur(greenIDX, (k | 1, k | 1), 0) if k > 1 else greenIDX
         threshold, threshIMG = cv.threshold(
             blur, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
         # Otsu always splits the image in two: on bare soil it would turn soil noise into

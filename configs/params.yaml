@@ -42,6 +42,9 @@
     band_height: 12                # px
     exg_normalized: true           # brightness independent green index (shadows, sun)
     exg_min: 0.1                   # minimal green level 0..1: bare soil gives no plant
+    exg_blur: 5                    # px, blur before the threshold; 0 for seedlings of 1-3 px
+    min_run_width: 3               # px, narrowest vegetation run giving a point (seedlings: 1)
+    band_fill: 0.3                 # share of the band height a column must be green (seedlings: 0.1)
     # Plants between scanStartPoint and scanEndPoint (image columns) are used to find the rows
     minContourArea: 40
     scanSteps: 30
