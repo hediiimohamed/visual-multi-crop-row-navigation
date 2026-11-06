@@ -70,20 +70,44 @@ def toRobot(pose, x, y):
     return c * dx + s * dy, -s * dx + c * dy
 
 
+def curveAt(f, x):
+    """y of the curve f = (a, b, c) at x"""
+    return f[0] + f[1] * x + f[2] * x ** 2
+
+
 def fitLine(x, y, w):
     """weighted least squares y = a + b*x (rows run along the robot x axis), refitted once
     without the outliers (leaves sticking out, a weed next to the row)"""
+    a, b, _ = fitCurve(x, y, w, 0.0)
+    return a, b
+
+
+def fitCurve(x, y, w, maxCurvature, minSpan=2.5):
+    """same as fitLine, y = a + b*x + c*x^2: wavy rows bend over the metres of history.
+    The bend is fitted only on points spread over minSpan metres, |2c| <= maxCurvature"""
+    quadratic = maxCurvature > 0 and len(x) >= 8 and np.ptp(x) >= minSpan
+    cMax = maxCurvature / 2
+
     def lsq(m):
-        A = np.c_[np.ones(np.count_nonzero(m)), x[m]] * np.sqrt(w[m])[:, None]
-        return np.linalg.lstsq(A, y[m] * np.sqrt(w[m]), rcond=None)[0]
+        sw = np.sqrt(w[m])
+        cols = [np.ones(np.count_nonzero(m)), x[m]]
+        if not quadratic:
+            a, b = np.linalg.lstsq(np.c_[cols[0], cols[1]] * sw[:, None], y[m] * sw, rcond=None)[0]
+            return a, b, 0.0
+        a, b, c = np.linalg.lstsq(np.c_[cols[0], cols[1], x[m] ** 2] * sw[:, None], y[m] * sw, rcond=None)[0]
+        if abs(c) > cMax:
+            # sharper than any crop row: keep the largest bend allowed, refit the rest
+            c = math.copysign(cMax, c)
+            a, b = np.linalg.lstsq(np.c_[cols[0], cols[1]] * sw[:, None], (y[m] - c * x[m] ** 2) * sw, rcond=None)[0]
+        return a, b, c
     m = np.ones(len(x), dtype=bool)
-    a, b = lsq(m)
+    a, b, c = lsq(m)
     if len(x) >= 6:
-        r = np.abs(y - (a + b * x))
+        r = np.abs(y - (a + b * x + c * x ** 2))
         keep = r <= max(2.5 * 1.4826 * np.median(r), 0.02)
         if np.count_nonzero(keep) >= 3 and not keep.all():
-            a, b = lsq(keep)
-    return a, b
+            a, b, c = lsq(keep)
+    return a, b, c
 
 
 class RowTracker:
@@ -112,6 +136,7 @@ class RowTracker:
         self.odometer = 0.0
         self.lastPose = None
         self.center = None          # (a, b): lane center, y = a at xRef with slope b, robot frame
+        self.curvature = 0.0        # bend c of the lane center: y = a + b*(x - xRef) + c*(x - xRef)^2
         self.centerOdom = None      # same line in the odom frame: (x, y, direction)
         self.badFrames = 0
         self.status = 'not initialized'
@@ -148,16 +173,34 @@ class RowTracker:
         ox, oy = toOdom(pose, robot[:, 0], robot[:, 1])
         return robot, np.c_[ox, oy]
 
-    def _rowLine(self, k, pose, xRef):
-        """robot-frame line y = a + b*x of row k, from the lane center when its history is too short"""
-        if len(self.rows[k]) >= self.p['minPoints']:
-            return self._fitRow(self.rows[k], pose)
-        b = self.center[1]
-        return self.center[0] + self.offsets[k] - b * xRef, b
-
     def _fitRow(self, pts, pose):
+        """robot-frame curve (a, b, c) of a row, y = a + b*x + c*x^2"""
         x, y = toRobot(pose, pts[:, 0], pts[:, 1])
-        return fitLine(x, y, np.minimum(pts[:, 2], self.p['maxPointWeight']))
+        return fitCurve(x, y, np.minimum(pts[:, 2], self.p['maxPointWeight']), self.p.get('maxCurvature', 0.2))
+
+    def _expectedLines(self, pose, xRef):
+        """robot-frame curves (a, b, c) where each row is looked for: its own fit while it
+        stays at its offset from the lane center, else that place on the lane"""
+        ca, cb = self._predictCenter(pose, xRef)
+        cc = self.curvature
+        tol = self.p.get('rowConsistency', 0.35) * self.furrowWidth
+        lines = []
+        for k in range(len(self.rows)):
+            # lane center y = ca + cb*(x - xRef) + cc*(x - xRef)^2, shifted by the row offset
+            lane = (ca + self.offsets[k] - cb * xRef + cc * xRef ** 2, cb - 2 * cc * xRef, cc)
+            if len(self.rows[k]) >= self.p['minPoints']:
+                f = self._fitRow(self.rows[k], pose)
+                if abs(curveAt(f, xRef) - (ca + self.offsets[k])) <= tol:
+                    lane = f
+            lines.append(lane)
+        return lines
+
+    def _keepNear(self, row, line, pose, gate):
+        """forget the plants of a row that are off its expected line (another row, weeds)"""
+        if len(row) == 0:
+            return row
+        x, y = toRobot(pose, row[:, 0], row[:, 1])
+        return row[np.abs(y - curveAt(line, x)) <= max(gate, 0.4 * self.furrowWidth)]
 
     # ------------------------------------------------------------------ initialization
     def initialize(self, pixels, pose, xRef, widths=None):
@@ -283,30 +326,32 @@ class RowTracker:
             near = np.abs(lat - c) <= gate
             if np.count_nonzero(near) < self.p['minPoints']:
                 return self._fail('row at %+.2f m has too few plants' % c)
-            a, b = fitLine(robot[near, 0], robot[near, 1], weight[near])
-            fits.append((a + b * xRef, b))
+            fits.append(fitCurve(robot[near, 0], robot[near, 1], weight[near], self.p.get('maxCurvature', 0.2)))
             rows.append(np.c_[odom[near], np.ones(np.count_nonzero(near)),
                               np.full(np.count_nonzero(near), self.odometer)])
-        lat0 = np.array([f[0] for f in fits])
+        # rows compared where their plants are seen: at xRef (bottom of the image, maybe hidden
+        # by a tool) the curves are extrapolated, wrong by several cm on wavy rows
+        xMid = float(np.median(robot[:, 0]))
+        lat0 = np.array([curveAt(f, xMid) for f in fits])
         if self.lane is not None:
             # same row as before the loss: place the rows found into the known lane
-            match = self._matchLane(lat0, pose, xRef)
+            match = self._matchLane(lat0, pose, xMid)
             if match is None:
                 return self._fail('rows found do not match the lane followed before')
             keep, offsets, furrow = match
             fits = [fits[j] for j in keep]
             rows = [rows[j] for j in keep]
             lat0 = lat0[keep]
-        headings = np.degrees(np.arctan([f[1] for f in fits]))
+        headings = np.degrees(np.arctan([f[1] + 2 * f[2] * xMid for f in fits]))
         if np.max(np.abs(headings - np.median(headings))) > self.p['maxRowAngleSpread']:
             return self._fail('rows not parallel (%s deg)' % np.round(headings, 1).tolist())
         if self.lane is None:
-            center = float(np.mean(lat0))
-            offsets = list(lat0 - center)
-        else:
-            center = float(np.mean(lat0 - np.array(offsets)))
-        slope = float(np.mean([f[1] for f in fits]))
-        offset = self.robotOffset(center, slope, xRef)
+            offsets = list(lat0 - np.mean(lat0))
+        # lane center at xRef: y = center + slope*(x - xRef) + bend*(x - xRef)^2
+        center = float(np.mean([curveAt(f, xRef) for f in fits]) - np.mean(offsets))
+        slope = float(np.mean([f[1] + 2 * f[2] * xRef for f in fits]))
+        bend = float(np.mean([f[2] for f in fits]))
+        offset = self.robotOffset(center, slope, xRef, bend)
         if abs(offset) > furrow / 2 + tol:
             return self._fail('robot %.2f m from the lane center, more than half a furrow' % offset)
 
@@ -314,17 +359,18 @@ class RowTracker:
         self.rows = rows
         self.offsets = list(offsets)
         self._setCenter(center, slope, pose, xRef)
+        self.curvature = bend
         self.badFrames = 0
         self.status = 'tracking %d rows, furrow %.2f m (%s)' % (len(rows), furrow,
                                                               'set' if self.p['furrowWidth'] > 0 else 'measured')
         return True
 
-    def _matchLane(self, lat, pose, xRef):
-        """rows found (lateral at xRef, sorted) -> (indices kept, their lane offsets, furrow),
+    def _matchLane(self, lat, pose, xAt):
+        """rows found (lateral at xAt, sorted) -> (indices kept, their lane offsets, furrow),
         aligned on the known lane so that the center is the closest to the previous one"""
         laneOffsets, furrow, centerOdom = self.lane
         self.centerOdom = centerOdom
-        predicted = self._predictCenter(pose, xRef)[0]
+        predicted = self._predictCenter(pose, xAt)[0]
         pattern = np.array(laneOffsets)
         best = None
         for shift in range(-len(lat) + 1, len(pattern)):
@@ -351,27 +397,38 @@ class RowTracker:
         exiting: past the last plants, keep the lane from the history / odometry, never lost"""
         self._advance(pose)
         gate = max(self.p['gateRatio'] * self.furrowWidth, self.p['minGate'])
-        candidates = []
+        lines = self._expectedLines(pose, xRef)
         ahead = 0
-        # farthest row plant of this image (odom), seen from here: the closer, the more accurate
-        self.farthestOdom, farthestX = None, -np.inf
+        robots, odoms = [], []
         for k, pixels in enumerate(rowPixels):
             robot, odom = self._project(pixels, pose)
-            a, b = self._rowLine(k, pose, xRef)
-            # plants far from the row's own line belong to a neighbour row or are weeds. The
-            # gate widens with the distance: a small heading error of the line moves it by
-            # several cm 6 m ahead, the far plants must still be accepted (or the line gets
-            # fitted on the near plants only, its heading gets worse, and so on)
-            gateAt = np.minimum(gate + np.maximum(robot[:, 0] - xNear, 0.0) * math.tan(math.radians(2.0)),
-                                max(gate, 0.45 * self.furrowWidth))
-            near = np.abs(robot[:, 1] - (a + b * robot[:, 0])) <= gateAt
-            candidates.append(odom[near])
-            if np.any(near) and np.max(robot[near, 0]) > farthestX:
-                i = int(np.argmax(np.where(near, robot[:, 0], -np.inf)))
-                farthestX, self.farthestOdom = robot[i, 0], odom[i]
+            robots.append(robot)
+            odoms.append(odom)
             if xAhead is not None:
                 # plants assigned to this row in the image, before the gate: the row goes on
                 ahead += int(np.count_nonzero(robot[:, 0] > xAhead))
+        robot, odom = np.vstack(robots), np.vstack(odoms)
+        # each plant goes to the closest expected row only: two rows can never share plants,
+        # so a row cannot slide onto its neighbour (wavy rows, uneven spacing)
+        if len(robot):
+            dist = np.abs(robot[:, 1][None, :] - np.array([curveAt(f, robot[:, 0]) for f in lines]))
+            owner = np.argmin(dist, axis=0)
+            dist = dist[owner, np.arange(len(robot))]
+        else:
+            owner, dist = np.zeros(0, dtype=int), np.zeros(0)
+        # plants far from the row line belong to a neighbour row or are weeds. The gate
+        # widens with the distance: a small heading error of the line moves it by several
+        # cm 6 m ahead, the far plants must still be accepted (or the line gets fitted on
+        # the near plants only, its heading gets worse, and so on)
+        gateAt = np.minimum(gate + np.maximum(robot[:, 0] - xNear, 0.0) * math.tan(math.radians(2.0)),
+                            max(gate, 0.45 * self.furrowWidth))
+        near = dist <= gateAt
+        candidates = [odom[near & (owner == k)] for k in range(len(self.rows))]
+        # farthest row plant of this image (odom), seen from here: the closer, the more accurate
+        self.farthestOdom = None
+        if np.any(near):
+            i = int(np.argmax(np.where(near, robot[:, 0], -np.inf)))
+            self.farthestOdom = odom[i]
         seen = sum(len(c) for c in candidates)
         self.noPlantSeen = 0 if seen >= self.p.get('minPointsAhead', 2) else self.noPlantSeen + 1
         if ahead >= self.p.get('minPointsAhead', 2):
@@ -396,20 +453,68 @@ class RowTracker:
             return False
 
         fits = [self._fitRow(newRows[k], pose) for k in valid]
-        # lane center from each visible row, shifted by its offset measured at initialization
-        a = float(np.mean([f[0] + f[1] * xRef - self.offsets[k] for f, k in zip(fits, valid)]))
-        b = float(np.mean([f[1] for f in fits]))
+        # lane center from each visible row, shifted by its offset measured at initialization.
+        # The rows of a bed keep their spacing: a row whose center disagrees with the others
+        # (or, with 2 rows, with the previous center) by more than rowConsistency furrow has
+        # drifted onto a neighbour row or weeds: not used, its plants off its place forgotten
+        centers = np.array([curveAt(f, xRef) - self.offsets[k] for f, k in zip(fits, valid)])
+        ref = float(np.median(centers)) if len(centers) >= 3 else self._predictCenter(pose, xRef)[0]
+        # same in the middle of the view: a row partly hidden can be right at xRef and bend
+        # away further on (badly constrained curve)
+        xMid = xAhead if xAhead is not None else xRef
+        centersAhead = np.array([curveAt(f, xMid) - self.offsets[k] for f, k in zip(fits, valid)])
+        if len(centersAhead) >= 3:
+            refAhead = float(np.median(centersAhead))
+        else:
+            pa, pb = self._predictCenter(pose, xRef)
+            refAhead = pa + pb * (xMid - xRef) + self.curvature * (xMid - xRef) ** 2
+        dev = np.maximum(np.abs(centers - ref), np.abs(centersAhead - refAhead))
+        tol = self.p.get('rowConsistency', 0.35) * self.furrowWidth
+        # full weight up to tol/2, none at tol: a wavy row moving around the limit does not
+        # make the lane center jump from one image to the next
+        weight = np.clip(2.0 - 2.0 * dev / tol, 0.0, 1.0)
+        consistent = weight > 0
+        for j in np.flatnonzero(~consistent):
+            newRows[valid[j]] = self._keepNear(newRows[valid[j]], lines[valid[j]], pose, gate)
+        if np.count_nonzero(consistent) < self.p['minRows']:
+            reason = 'rows not evenly spaced (%s cm from the lane)' % np.round(100 * dev).astype(int).tolist()
+            if exiting:
+                self.rows = newRows
+                return self._deadReckoning(pose, xRef, reason)
+            self.badFrames += 1
+            self.rows = [self._keepNear(r, l, pose, gate) for r, l in zip(newRows, lines)]
+            self.center = self._predictCenter(pose, xRef)
+            self.status = 'rejected (%d/%d): %s' % (self.badFrames, self.p['maxBadFrames'], reason)
+            if self.badFrames > self.p['maxBadFrames']:
+                self.status = 'lost: ' + reason
+                return False
+            return True
+        w = weight[consistent]
+        fits = [f for f, c in zip(fits, consistent) if c]
+        valid = [k for k, c in zip(valid, consistent) if c]
+        a = float(np.average(centers[consistent], weights=w))
+        # slope and bend at xRef: y = a + b*(x - xRef) + c*(x - xRef)^2
+        b = float(np.average([f[1] + 2 * f[2] * xRef for f in fits], weights=w))
+        c = float(np.average([f[2] for f in fits], weights=w))
         lateral, heading = a, math.degrees(math.atan(b))
         # robot offset from where the controller drives it (camera above the lane center),
         # at the robot (x = 0): independent of the heading, unlike the value at xRef
-        offset = self.robotOffset(a, b, xRef)
+        # (at the robot when the history reaches it, else at the nearest plants: the curves
+        # extrapolated behind their plants are not reliable)
+        xs = min(float(np.min(toRobot(pose, newRows[k][:, 0], newRows[k][:, 1])[0])) for k in valid)
+        offset = self.robotOffset(a, b, xRef, c, at=min(max(xs, 0.0), xRef))
 
         # the field does not move: compare with the previous estimate carried over in odom,
         # so that the robot turning (which moves the point at xRef) is not taken for a jump
         predicted = self._predictCenter(pose, xRef)
+        # measured where the rows are seen (the bottom of the image can be hidden, e.g. by a
+        # tool: there the lane is extrapolated and moves when the fit changes)
+        dx = (xAhead if xAhead is not None else xRef) - xRef
+        before = predicted[0] + predicted[1] * dx + self.curvature * dx ** 2
+        now = lateral + b * dx + c * dx ** 2
         reason = None
-        if abs(lateral - predicted[0]) > self.p['maxLateralJump']:
-            reason = 'lateral jump %.0f cm -> %.0f cm' % (100 * predicted[0], 100 * lateral)
+        if abs(now - before) > self.p['maxLateralJump']:
+            reason = 'lateral jump %.0f cm -> %.0f cm' % (100 * before, 100 * now)
         elif abs(offset) > self.maxLateralError():
             reason = 'lateral error %.0f cm > %.0f cm' % (100 * offset, 100 * self.maxLateralError())
         elif abs(heading) > self.p['maxHeadingError']:
@@ -430,6 +535,7 @@ class RowTracker:
         self.rows = newRows
         self.badFrames = 0
         self._setCenter(lateral, b, pose, xRef)
+        self.curvature = c
         self.status = 'tracking %d/%d rows, lateral %+.0f cm, heading %+.1f deg' % (
             len(valid), len(self.rows), 100 * offset, heading)
         return True
@@ -479,22 +585,30 @@ class RowTracker:
         b = math.tan(direction - pose[2])
         return y + b * (xRef - x), b
 
-    def robotOffset(self, a, b, xRef):
-        """lateral offset of the robot from its target line, lane center (a at xRef, slope b)"""
-        return -((a - b * xRef) - self.p['targetOffset'])
+    def robotOffset(self, a, b, xRef, c=0.0, at=0.0):
+        """lateral offset of the robot from its target line, lane center (a at xRef, slope b,
+        bend c: y = a + b*(x - xRef) + c*(x - xRef)^2), measured at x = at"""
+        d = at - xRef
+        return -((a + b * d + c * d ** 2) - self.p['targetOffset'])
 
     def maxLateralError(self):
         if self.p['maxLateralError'] > 0:
             return self.p['maxLateralError']
         return self.furrowWidth / 2
 
-    def rowLines(self, pose, xRef):
-        """robot-frame lines (a at xRef, b) of all rows, and of the lane center"""
-        rows = []
-        for k in range(len(self.rows)):
-            a, b = self._rowLine(k, pose, xRef)
-            rows.append((a + b * xRef, b))
-        return rows, self.center
+    def rowLines(self, pose, xRef, xFar=None):
+        """robot-frame lines (a at xRef, b) of all rows, and of the lane center: the chords of
+        the curves between xRef and xFar (straight lines for the image), else their tangents"""
+        def line(f):
+            if xFar is None or xFar <= xRef:
+                return curveAt(f, xRef), f[1] + 2 * f[2] * xRef
+            y0, y1 = curveAt(f, xRef), curveAt(f, xFar)
+            return y0, (y1 - y0) / (xFar - xRef)
+        rows = [line(f) for f in self._expectedLines(pose, xRef)]
+        if self.center is None:
+            return rows, None
+        a, b = self.center
+        return rows, line((a - b * xRef + self.curvature * xRef ** 2, b - 2 * self.curvature * xRef, self.curvature))
 
     def _merge(self, row, odom):
         """add plant centers; one seen again (within merge radius) is averaged, not duplicated"""

@@ -142,6 +142,8 @@ class vs_nodeHandler(Node):
         self.declare_parameter('max_heading_error', 15.0)       # deg
         self.declare_parameter('max_bad_frames', 5)             # rejected images in a row before lost
         self.declare_parameter('max_row_gap', 1.0)              # m driven without seeing a row
+        self.declare_parameter('max_curvature', 0.2)            # 1/m, sharpest row bend fitted (0: straight lines)
+        self.declare_parameter('row_consistency', 0.35)         # furrow, a row further from its place in the lane is not used
         self.declare_parameter('min_row_points', 4)
         # recovery when the rows are lost: stop, scan, creep forward, give up
         self.declare_parameter('recovery_scan_time', 1.0)       # s scanning while stopped
@@ -293,6 +295,8 @@ class vs_nodeHandler(Node):
             "maxHeadingError": self.get_parameter('max_heading_error').value,
             "maxBadFrames": self.get_parameter('max_bad_frames').value,
             "maxRowGap": self.get_parameter('max_row_gap').value,
+            "maxCurvature": self.get_parameter('max_curvature').value,
+            "rowConsistency": self.get_parameter('row_consistency').value,
             "maxFurrowWidth": self.get_parameter('max_furrow_width').value,
             "laneRows": self.get_parameter('lane_rows').value,
             "initConfirmFrames": self.get_parameter('init_confirm_frames').value,
@@ -913,9 +917,10 @@ class vs_nodeHandler(Node):
             # lane center line in the robot frame (metres), target shifted by lane_offset
             xRef = tracker.viewRange(self.imgHeight, self.trackerParams["topOffset"])[0]
             a, b = tracker.center
-            y0 = a - b * xRef + self.laneOffset
-            # point of the target line lookahead_distance ahead, circle arc through it
-            yL = y0 + b * self.lookahead
+            c = tracker.curvature
+            # point of the target line lookahead_distance ahead (bent lane: on the curve),
+            # circle arc through it
+            yL = a + b * (self.lookahead - xRef) + c * (self.lookahead - xRef) ** 2 + self.laneOffset
             curvature = 2.0 * yL / (self.lookahead ** 2 + yL ** 2)
             rho = self.linearVel * self.linearMotionDir
             omega = float(np.clip(curvature * abs(rho), -self.maxOmega, self.maxOmega))

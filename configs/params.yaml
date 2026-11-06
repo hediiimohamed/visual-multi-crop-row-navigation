@@ -74,13 +74,18 @@
     max_furrow_width: 1.2          # m, longest row spacing searched when measuring it
     lane_rows: 3                   # rows of one bed (sim: 3); 0: all evenly spaced rows found
     init_confirm_frames: 3         # the same lane must be found in 3 images before driving
-    history_size: 100              # last plant centers kept per row
-    history_length: 3.0            # m of history kept behind the camera view
+    history_size: 400              # last plant centers kept per row (enough to reach under the robot)
+    history_length: 1.0            # m of history kept behind the camera view (longer: lags in wavy rows)
     max_lateral_jump: 0.05         # m, larger change between two images is rejected
     max_lateral_error: 0.0         # m, 0: furrow_width / 2
     max_heading_error: 15.0        # deg
     max_bad_frames: 5              # rejected images in a row -> rows lost
     max_row_gap: 1.0               # m driven without seeing a row -> that row is not used
+    # wavy rows: each row is a curve y = a + b*x + c*x^2 over its history (bend fitted on >= 2.5 m)
+    max_curvature: 0.2             # 1/m, sharpest bend fitted (radius 5 m); 0: straight lines
+    # the rows of a bed keep their spacing: a row further than row_consistency * furrow from its
+    # place in the lane slid onto a neighbour row or weeds: not used, its wrong plants forgotten
+    row_consistency: 0.35          # (a row on its neighbour or between two: >= 0.5)
     # end of row: no row plant ahead in row_end_frames images -> EXIT: drive on along the lane
     # (odometry) until base_link is row_end_offset past the last plant, then vs_nav/row_end
     row_end_frames: 5

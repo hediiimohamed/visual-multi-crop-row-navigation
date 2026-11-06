@@ -144,7 +144,7 @@ class imageProc:
         if not self.cropLaneFound:
             self.log('#[INF] Find Crop Lane: ' + tracker.status)
             return
-        rows, center = tracker.rowLines(self.robotPose, xNear)
+        rows, center = tracker.rowLines(self.robotPose, xNear, xFar)
         self.CropRows = np.array([tracker.lineToImage(a - b * xNear, b, xNear, xFar) for a, b in rows])
         self.numOfCropRows = len(self.CropRows)
         self.trackingBoxLoc = np.zeros((self.numOfCropRows, 1))
@@ -571,7 +571,7 @@ class imageProc:
         self.trackStatus = tracker.status
 
         # ground lines back into the image: tracking boxes, drawing and visual servoing
-        rows, center = tracker.rowLines(self.robotPose, xRef)
+        rows, center = tracker.rowLines(self.robotPose, xRef, xFar)
         self.CropRows = np.array([tracker.lineToImage(a - b * xRef, b, xNear, xFar) for a, b in rows])
         self.numOfCropRows = len(self.CropRows)
         c, m = tracker.lineToImage(center[0] - center[1] * xRef, center[1], xNear, xFar)
