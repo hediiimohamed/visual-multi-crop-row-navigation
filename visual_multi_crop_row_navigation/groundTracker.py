@@ -179,9 +179,11 @@ class RowTracker:
         x, y = toRobot(pose, pts[:, 0], pts[:, 1])
         return fitCurve(x, y, np.minimum(pts[:, 2], self.p['maxPointWeight']), self.p.get('maxCurvature', 0.2))
 
-    def _expectedLines(self, pose, xRef):
+    def _expectedLines(self, pose, xRef, xMid=None):
         """robot-frame curves (a, b, c) where each row is looked for: its own fit while it
-        stays at its offset from the lane center, else that place on the lane"""
+        stays at its offset from the lane center (at xRef and in the middle of the view,
+        xMid: a row with few plants can be right at the bottom and bend away further on),
+        else that place on the lane"""
         ca, cb = self._predictCenter(pose, xRef)
         cc = self.curvature
         tol = self.p.get('rowConsistency', 0.35) * self.furrowWidth
@@ -191,7 +193,7 @@ class RowTracker:
             lane = (ca + self.offsets[k] - cb * xRef + cc * xRef ** 2, cb - 2 * cc * xRef, cc)
             if len(self.rows[k]) >= self.p['minPoints']:
                 f = self._fitRow(self.rows[k], pose)
-                if abs(curveAt(f, xRef) - (ca + self.offsets[k])) <= tol:
+                if all(abs(curveAt(f, x) - curveAt(lane, x)) <= tol for x in (xRef, xMid or xRef)):
                     lane = f
             lines.append(lane)
         return lines
@@ -620,7 +622,7 @@ class RowTracker:
                 return curveAt(f, xRef), f[1] + 2 * f[2] * xRef
             y0, y1 = curveAt(f, xRef), curveAt(f, xFar)
             return y0, (y1 - y0) / (xFar - xRef)
-        rows = [line(f) for f in self._expectedLines(pose, xRef)]
+        rows = [line(f) for f in self._expectedLines(pose, xRef, (xRef + xFar) / 2 if xFar else None)]
         if self.center is None:
             return rows, None
         a, b = self.center
