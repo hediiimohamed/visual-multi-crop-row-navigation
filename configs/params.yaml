@@ -91,7 +91,7 @@
     row_consistency: 0.35          # (a row on its neighbour or between two: >= 0.5)
     # a lane row whose plants are much narrower than those of the other rows over the last
     # metre is weeds (e.g. in a wheel path two furrows wide): the lane slid, rows lost
-    crop_width_ratio: 0.4          # 0.0: off (needs point_extraction: bands); 0.0 for seedlings (crops as small as weeds)
+    crop_width_ratio: 0.4          # 0.0: off (needs point_extraction: bands); not used while the rows are < 3 cm wide (seedlings)
     # end of row: no row plant ahead in row_end_frames images -> EXIT: drive on along the lane
     # (odometry) until base_link is row_end_offset past the last plant, then vs_nav/row_end
     row_end_frames: 5
@@ -116,6 +116,12 @@
     reference_path_topic: ""       # "": off
     max_path_deviation: 0.5        # m
     path_deviation_frames: 5       # images in a row beyond it
+    # vision box (phenotyping cameras above the plants): its crops (pheno_interfaces/Plants,
+    # is_weed false) must fill the rows of the lane and not the places one furrow outside it.
+    # A lane row without crops next to an outside place with crops: the lane slid -> recovery.
+    # Needs no geometry: the part of the lane the box covers comes from its plants
+    vision_box_topics: [""]        # e.g. ["/ET01_T_P/zedx_camera1/row1/plants", ...]; [""]: off
+    vision_box_frames: 5           # images in a row
 
     # Debug
     verbose: false                 # per-image debug output (costs CPU)

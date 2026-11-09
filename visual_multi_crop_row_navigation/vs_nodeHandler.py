@@ -33,6 +33,7 @@ from visual_multi_crop_row_navigation import imageProc as imc
 from visual_multi_crop_row_navigation import controller as visualServoingCtl
 from visual_multi_crop_row_navigation import groundTracker as gt
 from visual_multi_crop_row_navigation.pathWatchdog import PathWatchdog
+from visual_multi_crop_row_navigation.visionBoxCheck import VisionBoxCheck
 from nav_msgs.msg import Path
 from visual_multi_crop_row_navigation.featureMatching import *
 
@@ -163,6 +164,10 @@ class vs_nodeHandler(Node):
         self.declare_parameter('reference_path_topic', '')      # '' : off
         self.declare_parameter('max_path_deviation', 0.5, ParameterDescriptor(dynamic_typing=True))  # m from the path -> FAILED
         self.declare_parameter('path_deviation_frames', 5)      # images in a row beyond it
+        # vision box (phenotyping cameras above the plants, pheno_interfaces/Plants): its crops
+        # must fill the lane rows, not the places one furrow outside the lane
+        self.declare_parameter('vision_box_topics', [''])       # Plants topics; [''] : off
+        self.declare_parameter('vision_box_frames', 5)          # images in a row saying 'the lane slid'
 
         # Get parameter values
         self.frontColor_topic = self.get_parameter('frontColor_topic').value
@@ -234,6 +239,20 @@ class vs_nodeHandler(Node):
                 self.create_subscription(Path, pathTopic, self.path_callback,
                                          QoSProfile(depth=1, durability=durability))
             self.path_deviation_pub = self.create_publisher(Float32, 'vs_nav/path_deviation', 1)
+        boxTopics = [t for t in self.get_parameter('vision_box_topics').value if t]
+        self.visionBoxOn = False
+        if boxTopics:
+            try:
+                from pheno_interfaces.msg import Plants
+            except ImportError:
+                self.get_logger().error("vision_box_topics set but pheno_interfaces is not installed: vision box check off")
+            else:
+                # the plant map publishes best effort, keep last 1
+                boxQos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+                for t in boxTopics:
+                    self.create_subscription(Plants, t, self.plants_callback, boxQos)
+                self.visionBoxOn = True
+                self.get_logger().info(f"Vision box check on {boxTopics}")
 
         # settings
         self.navigationMode = self.get_parameter('navigationMode').value                   
@@ -351,6 +370,9 @@ class vs_nodeHandler(Node):
         self.pathCheckOn = bool(self.get_parameter('reference_path_topic').value)
         self.pathDeviationFrames = self.get_parameter('path_deviation_frames').value
         self.pathBadFrames = 0
+        self.visionBox = VisionBoxCheck()
+        self.visionBoxFrames = self.get_parameter('vision_box_frames').value
+        self.visionBoxBad = 0
         self.processingWidth = self.get_parameter('processing_width').value
         self.controller = self.get_parameter('controller').value
         self.lookahead = self.get_parameter('lookahead_distance').value
@@ -607,6 +629,16 @@ class vs_nodeHandler(Node):
             self.imageProcessor.trackCropLane(self.navigationMode)
             if self.imageProcessor.trackingLost and not self.isExitingLane():
                 self.startRecovery(pose, now, self.imageProcessor.trackStatus)
+                return
+            boxReason = self.checkVisionBox(pose) if self.state == 'TRACKING' else None
+            if boxReason is not None:
+                # the camera's lane is not the crop rows: forget it (a recovery would look for
+                # the same lane again) and find the rows around the robot again
+                if tracker is not None:
+                    rows = tracker.laneRowsFound
+                    tracker.forgetLane()
+                    tracker.laneRowsFound = rows
+                self.startRecovery(pose, now, boxReason)
                 return
             # ground tracker, no lane switch: the row ends where its last plant is
             groundRowEnd = tracker is not None and not self.enableRowSwitching and not self.isExitingLane()
@@ -866,6 +898,44 @@ class vs_nodeHandler(Node):
         self.get_logger().info(f"Reference path: {len(points)} poses in {self.pathWatchdog.frame}, "
                                f"max deviation {self.pathWatchdog.maxDeviation:.2f} m")
 
+    def plants_callback(self, msg):
+        """vision box plants (tool frame) -> odom, kept over the last metre"""
+        tracker = self.imageProcessor.groundTracker
+        if tracker is None or msg.band_mode or not msg.plants:
+            # band mode: the crop is a band, plants are weeds only
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(self.odomFrame, msg.header.frame_id, Time.from_msg(msg.header.stamp))
+        except tf2_ros.TransformException:
+            try:
+                tf = self.tf_buffer.lookup_transform(self.odomFrame, msg.header.frame_id, Time())
+            except tf2_ros.TransformException as e:
+                self.get_logger().warn(f"vision box: no {self.odomFrame} -> {msg.header.frame_id} transform: {e}",
+                                       throttle_duration_sec=5.0)
+                return
+        t, q = tf.transform.translation, tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        c, sn = math.cos(yaw), math.sin(yaw)
+        pts = np.array([(p.stem_point.x, p.stem_point.y) for p in msg.plants])
+        odom = np.c_[t.x + c * pts[:, 0] - sn * pts[:, 1], t.y + sn * pts[:, 0] + c * pts[:, 1]]
+        self.visionBox.add(odom, [not p.is_weed for p in msg.plants], tracker.odometer)
+
+    def checkVisionBox(self, pose):
+        """reason (str) when the vision box crops say the tracked lane slid, else None"""
+        tracker = self.imageProcessor.groundTracker
+        if not self.visionBoxOn or tracker is None or not tracker.initialized or tracker.center is None:
+            return None
+        xRef = tracker.viewRange(self.imgHeight, self.trackerParams["topOffset"])[0]
+        a, b, bend = tracker.center[0], tracker.center[1], tracker.curvature
+        rx, ry = gt.toRobot(pose, self.visionBox.points[:, 0], self.visionBox.points[:, 1])
+        res = self.visionBox.check(np.c_[rx, ry], lambda x: a + b * (x - xRef) + bend * (x - xRef) ** 2,
+                                   tracker.offsets, tracker.furrowWidth, tracker.odometer)
+        self.visionBoxBad = self.visionBoxBad + 1 if isinstance(res, str) else 0
+        if self.visionBoxBad > self.visionBoxFrames:
+            self.visionBoxBad = 0
+            return res
+        return None
+
     def checkPath(self, newImage):
         """False (robot stopped) when the robot has left its part of the reference path, or
         when the watchdog is on but cannot check (no path, no transform to the path frame)"""
@@ -919,6 +989,8 @@ class vs_nodeHandler(Node):
         self.exitRef = None
         self.pathWatchdog.reset()
         self.pathBadFrames = 0
+        self.visionBox.reset()
+        self.visionBoxBad = 0
         self.active = True
         self.row_end_pub.publish(Bool(data=False))
         self.get_logger().info("Row following started")
