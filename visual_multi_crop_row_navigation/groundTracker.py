@@ -122,6 +122,7 @@ class RowTracker:
         """new row: forget the lane found before"""
         self.lane = None
         self.cropWidthRef = None    # mean crop width of the lane rows (see _weakRow)
+        self.laneRowsFound = 0      # rows of the lane found at the start of this row (laneRows 0: measured)
         self.initialized = False
         self.candidates = []        # lanes found in the last images, before confirmation
 
@@ -227,7 +228,7 @@ class RowTracker:
         widths: vegetation width (pixels) at each point, wide rows outweigh small weeds.
         True once the same lane was found in initConfirmFrames images in a row."""
         if not self._findLane(pixels, pose, xRef, widths):
-            if self.lane is None or self.p.get('laneRows', 0) <= 0:
+            if self.lane is None or self._laneRows() <= 0:
                 self.candidates = []
                 return False
             # the rows do not fit the lane followed before (its position comes from the
@@ -256,6 +257,10 @@ class RowTracker:
             self.status = 'init: lane found %d/%d times' % (len(self.candidates), need)
             return False
         self.candidates = []
+        if self.lane is None and not self.laneRowsFound:
+            # laneRows 0: the rows of the lane confirmed at the start of the row, for the recovery
+            # (not those of a single image: one can miss a row)
+            self.laneRowsFound = len(self.offsets)
         self.initialized = True
         return True
 
@@ -337,7 +342,7 @@ class RowTracker:
         if len(chain) < self.p['minRows']:
             return self._fail('row spacing %s m does not match the %s %.2f m'
                               % (np.round(np.diff(peaks), 2).tolist(), ref, furrow))
-        laneRows = self.p.get('laneRows', 0)
+        laneRows = self._laneRows()
         if laneRows > 0 and self.lane is None:
             # the lane is made of laneRows rows: the ones around the robot's target
             if len(chain) < laneRows:
@@ -392,6 +397,10 @@ class RowTracker:
         self.status = 'tracking %d rows, furrow %.2f m (%s)' % (len(rows), furrow,
                                                               'set' if self.p['furrowWidth'] > 0 else 'measured')
         return True
+
+    def _laneRows(self):
+        """rows of one lane: the laneRows parameter, else as many as found at the start of the row"""
+        return self.p.get('laneRows', 0) or getattr(self, 'laneRowsFound', 0)
 
     def _matchLane(self, lat, pose, xAt):
         """rows found (lateral at xAt, sorted) -> (indices kept, their lane offsets, furrow),
@@ -663,6 +672,9 @@ class RowTracker:
         elif getattr(self, 'cropWidthRef', None) is not None and np.any(seen):
             ref = self.cropWidthRef
         else:
+            return None
+        if ref < self.p.get('minCropWidth', 0.03):
+            # seedlings: crops as small as weeds, the width tells nothing
             return None
         weak = [k for k in range(len(mean)) if seen[k] and mean[k] < ratio * ref]
         if not weak:

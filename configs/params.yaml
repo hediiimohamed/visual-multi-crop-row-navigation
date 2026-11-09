@@ -91,7 +91,7 @@
     row_consistency: 0.35          # (a row on its neighbour or between two: >= 0.5)
     # a lane row whose plants are much narrower than those of the other rows over the last
     # metre is weeds (e.g. in a wheel path two furrows wide): the lane slid, rows lost
-    crop_width_ratio: 0.4          # 0.0: off (needs point_extraction: bands); 0.0 for seedlings (crops as small as weeds)
+    crop_width_ratio: 0.4          # 0.0: off (needs point_extraction: bands); not used while the rows are < 3 cm wide (seedlings)
     # end of row: no row plant ahead in row_end_frames images -> EXIT: drive on along the lane
     # (odometry) until base_link is row_end_offset past the last plant, then vs_nav/row_end
     row_end_frames: 5
