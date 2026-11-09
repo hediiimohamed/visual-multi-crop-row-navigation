@@ -627,6 +627,13 @@ class vs_nodeHandler(Node):
                     # the camera is blocked or blinded, it is not the end of the row
                     lastPlant = self.exitTarget - self.rowEndOffset - self.alongExit(pose)
                     xNear = tracker.viewRange(self.imgHeight, self.trackerParams["topOffset"])[0]
+                    # the plants are tracked down to the bottom edge of the tracking boxes
+                    # (imgHeight - topOffset), not to the bottom of the image: closer ones are
+                    # out of the tracked view, not missed
+                    xCut = tracker.projector.pixelToGround([tracker.projector.K[2]],
+                                                           [self.imgHeight - self.trackerParams["topOffset"]])[0][0]
+                    if np.isfinite(xCut):
+                        xNear = max(xNear, float(xCut))
                     if lastPlant > xNear + 0.3 and tracker.blind():
                         self.imageProcessor.exiting = False
                         self.startRecovery(pose, now, "no crop row in view although the last plants are %.1f m ahead"
