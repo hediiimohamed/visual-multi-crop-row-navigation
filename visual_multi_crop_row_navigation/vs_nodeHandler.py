@@ -8,6 +8,7 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from rclpy.duration import Duration
 from rclpy.time import Time
+from rcl_interfaces.msg import ParameterDescriptor
 import math
 import cv2 as cv
 import numpy as np
@@ -20,7 +21,7 @@ import tf2_ros
 import tf2_geometry_msgs
 import image_geometry
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Float64, Bool, String
+from std_msgs.msg import Float32, Float64, Bool, String
 from std_srvs.srv import Trigger
 from rclpy.qos import QoSDurabilityPolicy
 from visual_multi_crop_row_navigation.imgConversion import CvBridge, CvBridgeError
@@ -31,6 +32,8 @@ from visual_multi_crop_row_navigation import Camera as cam
 from visual_multi_crop_row_navigation import imageProc as imc
 from visual_multi_crop_row_navigation import controller as visualServoingCtl
 from visual_multi_crop_row_navigation import groundTracker as gt
+from visual_multi_crop_row_navigation.pathWatchdog import PathWatchdog
+from nav_msgs.msg import Path
 from visual_multi_crop_row_navigation.featureMatching import *
 
 class vs_nodeHandler(Node):
@@ -147,6 +150,7 @@ class vs_nodeHandler(Node):
         self.declare_parameter('max_row_gap', 1.0)              # m driven without seeing a row
         self.declare_parameter('max_curvature', 0.2)            # 1/m, sharpest row bend fitted (0: straight lines)
         self.declare_parameter('row_consistency', 0.35)         # furrow, a row further from its place in the lane is not used
+        self.declare_parameter('crop_width_ratio', 0.4, ParameterDescriptor(dynamic_typing=True))  # lane row narrower than this x the others: weeds (0.0: off)
         self.declare_parameter('min_row_points', 4)
         # recovery when the rows are lost: stop, scan, creep forward, give up
         self.declare_parameter('recovery_scan_time', 1.0)       # s scanning while stopped
@@ -155,6 +159,10 @@ class vs_nodeHandler(Node):
         # watchdogs
         self.declare_parameter('image_timeout', 0.5)            # s without a new image: stop
         self.declare_parameter('max_omega_rate', 0.5)           # rad/s^2
+        # independent of the camera: distance to the planned coverage path (nav_msgs/Path)
+        self.declare_parameter('reference_path_topic', '')      # '' : off
+        self.declare_parameter('max_path_deviation', 0.5, ParameterDescriptor(dynamic_typing=True))  # m from the path -> FAILED
+        self.declare_parameter('path_deviation_frames', 5)      # images in a row beyond it
 
         # Get parameter values
         self.frontColor_topic = self.get_parameter('frontColor_topic').value
@@ -219,6 +227,13 @@ class vs_nodeHandler(Node):
         self.create_service(Trigger, 'vs_nav/start', self.start_callback)
         # state and reason, e.g. "SCAN: rows lost (...)", "TRACKING: 3/3 rows, lateral +2 cm"
         self.status_pub = self.create_publisher(String, 'vs_nav/status', latched_qos)
+        pathTopic = self.get_parameter('reference_path_topic').value
+        if pathTopic:
+            # the plan is published once: keep the last one (latched publishers too)
+            for durability in (QoSDurabilityPolicy.TRANSIENT_LOCAL, QoSDurabilityPolicy.VOLATILE):
+                self.create_subscription(Path, pathTopic, self.path_callback,
+                                         QoSProfile(depth=1, durability=durability))
+            self.path_deviation_pub = self.create_publisher(Float32, 'vs_nav/path_deviation', 1)
 
         # settings
         self.navigationMode = self.get_parameter('navigationMode').value                   
@@ -303,6 +318,7 @@ class vs_nodeHandler(Node):
             "maxRowGap": self.get_parameter('max_row_gap').value,
             "maxCurvature": self.get_parameter('max_curvature').value,
             "rowConsistency": self.get_parameter('row_consistency').value,
+            "cropWidthRatio": float(self.get_parameter('crop_width_ratio').value),
             "maxFurrowWidth": self.get_parameter('max_furrow_width').value,
             "laneRows": self.get_parameter('lane_rows').value,
             "initConfirmFrames": self.get_parameter('init_confirm_frames').value,
@@ -331,6 +347,10 @@ class vs_nodeHandler(Node):
         self.recoveryStep = self.get_parameter('recovery_step').value
         self.recoveryMaxDistance = self.get_parameter('recovery_max_distance').value
         self.imageTimeout = self.get_parameter('image_timeout').value
+        self.pathWatchdog = PathWatchdog(float(self.get_parameter('max_path_deviation').value))
+        self.pathCheckOn = bool(self.get_parameter('reference_path_topic').value)
+        self.pathDeviationFrames = self.get_parameter('path_deviation_frames').value
+        self.pathBadFrames = 0
         self.processingWidth = self.get_parameter('processing_width').value
         self.controller = self.get_parameter('controller').value
         self.lookahead = self.get_parameter('lookahead_distance').value
@@ -501,6 +521,8 @@ class vs_nodeHandler(Node):
             return
         self.lastHold = None
         self.imageProcessor.robotPose = pose
+        if not self.checkPath(imgSeq != self.processedSeq):
+            return
 
         if self.state == 'ADVANCE':
             self.advance(pose, now)
@@ -835,6 +857,47 @@ class vs_nodeHandler(Node):
         self.get_logger().info(f"Row finished ({reason}): robot stopped, waiting for vs_nav/start")
         self.setState('ROW_END', reason)
 
+    def path_callback(self, msg):
+        points = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        if len(points) < 2:
+            return
+        if not self.pathWatchdog.setPath(points, msg.header.frame_id or self.odomFrame):
+            return
+        self.get_logger().info(f"Reference path: {len(points)} poses in {self.pathWatchdog.frame}, "
+                               f"max deviation {self.pathWatchdog.maxDeviation:.2f} m")
+
+    def checkPath(self, newImage):
+        """False (robot stopped) when the robot has left its part of the reference path, or
+        when the watchdog is on but cannot check (no path, no transform to the path frame)"""
+        if not self.pathCheckOn or self.state not in ('TRACKING', 'EXIT'):
+            return True
+        if self.pathWatchdog.path is None:
+            self.get_logger().warn(f"path watchdog: no path received on {self.get_parameter('reference_path_topic').value}",
+                                   throttle_duration_sec=5.0)
+            return True
+        try:
+            tf = self.tf_buffer.lookup_transform(self.pathWatchdog.frame, self.baseFrame, Time())
+        except tf2_ros.TransformException:
+            # the check is part of the safety: no transform, no driving
+            self.holdStop("path watchdog: no %s -> %s transform" % (self.pathWatchdog.frame, self.baseFrame))
+            return False
+        t, q = tf.transform.translation, tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        # the yaw tells the pass from the neighbour one, driven the other way (backwards: none)
+        deviation = self.pathWatchdog.check(t.x, t.y, yaw if self.linearMotionDir > 0 else None)
+        if deviation is None:
+            self.get_logger().warn("path watchdog: no part of the path goes the robot's way", throttle_duration_sec=5.0)
+            return True
+        self.path_deviation_pub.publish(Float32(data=deviation))
+        if newImage:
+            # counted per image, like the tracker's bad frames (the timer runs faster)
+            self.pathBadFrames = self.pathBadFrames + 1 if self.pathWatchdog.exceeded() else 0
+        if self.pathBadFrames > self.pathDeviationFrames:
+            self.fail("robot %.2f m from the reference path (> %.2f m): the camera follows the wrong rows?"
+                      % (deviation, self.pathWatchdog.maxDeviation))
+            return False
+        return True
+
     def start_callback(self, request, response):
         # follow the next row from the beginning: forward, front camera
         self.navigationMode = 1
@@ -854,6 +917,8 @@ class vs_nodeHandler(Node):
         self.lastCmdTime = None
         self.imageProcessor.exiting = False
         self.exitRef = None
+        self.pathWatchdog.reset()
+        self.pathBadFrames = 0
         self.active = True
         self.row_end_pub.publish(Bool(data=False))
         self.get_logger().info("Row following started")

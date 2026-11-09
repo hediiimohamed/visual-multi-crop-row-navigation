@@ -89,6 +89,9 @@
     # the rows of a bed keep their spacing: a row further than row_consistency * furrow from its
     # place in the lane slid onto a neighbour row or weeds: not used, its wrong plants forgotten
     row_consistency: 0.35          # (a row on its neighbour or between two: >= 0.5)
+    # a lane row whose plants are much narrower than those of the other rows over the last
+    # metre is weeds (e.g. in a wheel path two furrows wide): the lane slid, rows lost
+    crop_width_ratio: 0.4          # 0.0: off (needs point_extraction: bands); 0.0 for seedlings (crops as small as weeds)
     # end of row: no row plant ahead in row_end_frames images -> EXIT: drive on along the lane
     # (odometry) until base_link is row_end_offset past the last plant, then vs_nav/row_end
     row_end_frames: 5
@@ -105,6 +108,14 @@
     # ==================== WATCHDOGS ====================
     image_timeout: 0.5             # s without a new camera image -> stop
     max_omega_rate: 0.5            # rad/s^2, limit on the steering command change
+    # independent of the camera: the camera alone cannot tell a wrong bed from the right one
+    # when both look the same (weeds in a wheel path two furrows wide). The planned coverage
+    # path (nav_msgs/Path, e.g. /coverage_server/coverage_plan, or a GNSS track) must stay
+    # within max_path_deviation of base_link, or FAILED. Set it above how far the real rows
+    # wander from the plan (RTK seeding: 0.3; Isaac beds2/3/weeds2 manual seeding: 0.6-0.7)
+    reference_path_topic: ""       # "": off
+    max_path_deviation: 0.5        # m
+    path_deviation_frames: 5       # images in a row beyond it
 
     # Debug
     verbose: false                 # per-image debug output (costs CPU)

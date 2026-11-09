@@ -121,6 +121,7 @@ class RowTracker:
     def forgetLane(self):
         """new row: forget the lane found before"""
         self.lane = None
+        self.cropWidthRef = None    # mean crop width of the lane rows (see _weakRow)
         self.initialized = False
         self.candidates = []        # lanes found in the last images, before confirmation
 
@@ -145,6 +146,7 @@ class RowTracker:
         self.plantAhead = 0        # images in a row with some
         self.noPlantSeen = 0       # images in a row without any row plant in the whole view
         self.lastAheadOdometer = 0.0   # odometer when row plants were last seen ahead
+        self.cropSupport = None    # per row, over the last metre: [ground width sum, points] of its plants
 
     # ------------------------------------------------------------------ geometry
     def viewRange(self, imgHeight, topOffset):
@@ -174,6 +176,15 @@ class RowTracker:
         ox, oy = toOdom(pose, robot[:, 0], robot[:, 1])
         return robot, np.c_[ox, oy]
 
+    def _groundWidths(self, pixels, widths):
+        """vegetation width (m on the ground) of each point kept by _project, from its width in pixels"""
+        pixels = np.asarray(pixels, dtype=float).reshape(-1, 2)
+        w = np.asarray(widths, dtype=float)
+        ok = np.isfinite(self.projector.pixelToGround(pixels[:, 0], pixels[:, 1])[0])
+        xl, yl = self.projector.pixelToGround(pixels[ok, 0] - w[ok] / 2, pixels[ok, 1])
+        xr, yr = self.projector.pixelToGround(pixels[ok, 0] + w[ok] / 2, pixels[ok, 1])
+        return np.nan_to_num(np.clip(np.hypot(xr - xl, yr - yl), 0.01, 0.3), nan=0.01)
+
     def _fitRow(self, pts, pose):
         """robot-frame curve (a, b, c) of a row, y = a + b*x + c*x^2"""
         x, y = toRobot(pose, pts[:, 0], pts[:, 1])
@@ -188,14 +199,17 @@ class RowTracker:
         cc = self.curvature
         tol = self.p.get('rowConsistency', 0.35) * self.furrowWidth
         lines = []
+        self.ownFit = []            # per row: True when its line is its own fit, not its lane place
         for k in range(len(self.rows)):
             # lane center y = ca + cb*(x - xRef) + cc*(x - xRef)^2, shifted by the row offset
             lane = (ca + self.offsets[k] - cb * xRef + cc * xRef ** 2, cb - 2 * cc * xRef, cc)
+            own = False
             if len(self.rows[k]) >= self.p['minPoints']:
                 f = self._fitRow(self.rows[k], pose)
                 if all(abs(curveAt(f, x) - curveAt(lane, x)) <= tol for x in (xRef, xMid or xRef)):
-                    lane = f
+                    lane, own = f, True
             lines.append(lane)
+            self.ownFit.append(own)
         return lines
 
     def _keepNear(self, row, line, pose, gate):
@@ -409,39 +423,40 @@ class RowTracker:
         return False
 
     # ------------------------------------------------------------------ tracking
-    def update(self, rowPixels, pose, xRef, xNear, xAhead=None, exiting=False):
+    def update(self, rowPixels, pose, xRef, xNear, xAhead=None, exiting=False, rowWidths=None):
         """returns True while the lane is tracked; self.status tells why not.
         xAhead: plants of the rows beyond it count as 'row continues' (row end detection).
-        exiting: past the last plants, keep the lane from the history / odometry, never lost"""
+        exiting: past the last plants, keep the lane from the history / odometry, never lost.
+        rowWidths: vegetation width (pixels) of each point of rowPixels, if known"""
+        odometerBefore = self.odometer
         self._advance(pose)
         gate = max(self.p['gateRatio'] * self.furrowWidth, self.p['minGate'])
         lines = self._expectedLines(pose, xRef)
         ahead = 0
-        robots, odoms = [], []
+        robots, odoms, widths = [], [], []
+        withWidths = rowWidths is not None and all(w is not None for w in rowWidths)
         for k, pixels in enumerate(rowPixels):
             robot, odom = self._project(pixels, pose)
             robots.append(robot)
             odoms.append(odom)
+            if withWidths:
+                widths.append(self._groundWidths(pixels, rowWidths[k]) if len(pixels) else np.zeros(0))
             if xAhead is not None:
                 # plants assigned to this row in the image, before the gate: the row goes on
                 ahead += int(np.count_nonzero(robot[:, 0] > xAhead))
         robot, odom = np.vstack(robots), np.vstack(odoms)
-        # each plant goes to the closest expected row only: two rows can never share plants,
-        # so a row cannot slide onto its neighbour (wavy rows, uneven spacing)
-        if len(robot):
-            dist = np.abs(robot[:, 1][None, :] - np.array([curveAt(f, robot[:, 0]) for f in lines]))
-            owner = np.argmin(dist, axis=0)
-            dist = dist[owner, np.arange(len(robot))]
-        else:
-            owner, dist = np.zeros(0, dtype=int), np.zeros(0)
         # plants far from the row line belong to a neighbour row or are weeds. The gate
         # widens with the distance: a small heading error of the line moves it by several
         # cm 6 m ahead, the far plants must still be accepted (or the line gets fitted on
         # the near plants only, its heading gets worse, and so on)
         gateAt = np.minimum(gate + np.maximum(robot[:, 0] - xNear, 0.0) * math.tan(math.radians(2.0)),
                             max(gate, 0.45 * self.furrowWidth))
-        near = dist <= gateAt
+        owner, near, dist = self._assign(robot, lines, gateAt, pose, xNear)
         candidates = [odom[near & (owner == k)] for k in range(len(self.rows))]
+        if withWidths:
+            # only the plants close to their row line: weeds at the edge of the gate do not count
+            self._updateCropSupport(np.concatenate(widths), near & (dist <= 0.5 * gateAt), owner,
+                                    self.odometer - odometerBefore)
         # farthest row plant of this image (odom), seen from here: the closer, the more accurate
         self.farthestOdom = None
         if np.any(near):
@@ -470,6 +485,8 @@ class RowTracker:
             self.status = 'lost: %d row(s) visible, %d needed' % (len(valid), self.p['minRows'])
             return False
 
+        xMid = xAhead if xAhead is not None else xRef
+        tol = self.p.get('rowConsistency', 0.35) * self.furrowWidth
         fits = [self._fitRow(newRows[k], pose) for k in valid]
         # lane center from each visible row, shifted by its offset measured at initialization.
         # The rows of a bed keep their spacing: a row whose center disagrees with the others
@@ -479,7 +496,6 @@ class RowTracker:
         ref = float(np.median(centers)) if len(centers) >= 3 else self._predictCenter(pose, xRef)[0]
         # same in the middle of the view: a row partly hidden can be right at xRef and bend
         # away further on (badly constrained curve)
-        xMid = xAhead if xAhead is not None else xRef
         centersAhead = np.array([curveAt(f, xMid) - self.offsets[k] for f, k in zip(fits, valid)])
         if len(centersAhead) >= 3:
             refAhead = float(np.median(centersAhead))
@@ -487,7 +503,6 @@ class RowTracker:
             pa, pb = self._predictCenter(pose, xRef)
             refAhead = pa + pb * (xMid - xRef) + self.curvature * (xMid - xRef) ** 2
         dev = np.maximum(np.abs(centers - ref), np.abs(centersAhead - refAhead))
-        tol = self.p.get('rowConsistency', 0.35) * self.furrowWidth
         # full weight up to tol/2, none at tol: a wavy row moving around the limit does not
         # make the lane center jump from one image to the next
         weight = np.clip(2.0 - 2.0 * dev / tol, 0.0, 1.0)
@@ -537,6 +552,8 @@ class RowTracker:
             reason = 'lateral error %.0f cm > %.0f cm' % (100 * offset, 100 * self.maxLateralError())
         elif abs(heading) > self.p['maxHeadingError']:
             reason = 'heading error %.1f deg > %.1f deg' % (heading, self.p['maxHeadingError'])
+        else:
+            reason = self._weakRow()
         if reason is not None and exiting:
             self.rows = newRows
             return self._deadReckoning(pose, xRef, reason)
@@ -557,6 +574,101 @@ class RowTracker:
         self.status = 'tracking %d/%d rows, lateral %+.0f cm, heading %+.1f deg' % (
             len(valid), len(self.rows), 100 * offset, heading)
         return True
+
+    def _assign(self, robot, lines, gateAt, pose, xNear):
+        """each plant of the image to one row (owner) if within the gate of its line (near).
+        Each plant goes to the closest row only: two rows can never share plants, so a row
+        cannot slide onto its neighbour. The rows are grown from the robot outwards, one
+        metre at a time, refitted on the plants accepted so far: in a bend the far plants
+        leave the row extrapolated over 6 m, but not the one extrapolated over 1 m.
+        A row on its lane place (its own fit had drifted, see _expectedLines) is grown from the
+        plants of this image only, and only while it stays at that place: its history is the
+        drifted one."""
+        owner = np.zeros(len(robot), dtype=int)
+        near = np.zeros(len(robot), dtype=bool)
+        distance = np.full(len(robot), np.inf)
+        if not len(robot):
+            return owner, near, distance
+        ownFit = getattr(self, 'ownFit', [True] * len(lines))
+        tol = self.p.get('rowConsistency', 0.35) * self.furrowWidth
+        hist = []
+        for r in self.rows:
+            if len(r):
+                hx, hy = toRobot(pose, r[:, 0], r[:, 1])
+                hist.append((hx, hy, np.minimum(r[:, 2], self.p['maxPointWeight'])))
+            else:
+                hist.append((np.zeros(0), np.zeros(0), np.zeros(0)))
+        cur = list(lines)
+        step = self.p.get('growStep', 1.0)
+        fronts = np.arange(xNear + step, robot[:, 0].max() + step, step) if step > 0 else [np.inf]
+        done = np.zeros(len(robot), dtype=bool)
+        for k, front in enumerate(fronts):
+            last = k == len(fronts) - 1
+            win = ~done & ((robot[:, 0] <= front) | last)
+            if not np.any(win):
+                continue
+            idx = np.flatnonzero(win)
+            dist = np.abs(robot[idx, 1][None, :] - np.array([curveAt(f, robot[idx, 0]) for f in cur]))
+            own = np.argmin(dist, axis=0)
+            ok = dist[own, np.arange(len(idx))] <= gateAt[idx]
+            owner[idx], near[idx], done[idx] = own, ok, True
+            distance[idx] = dist[own, np.arange(len(idx))]
+            if last:
+                break
+            # refit the rows on their history and the plants accepted so far
+            for j in range(len(cur)):
+                mine = near & (owner == j)
+                if not np.any(mine):
+                    continue
+                hx, hy, hw = hist[j]
+                behind = hx <= front        # older plants further ahead were gated on the old curve
+                if not ownFit[j]:
+                    behind = np.zeros(len(hx), dtype=bool)
+                x = np.r_[hx[behind], robot[mine, 0]]
+                if len(x) < self.p['minPoints']:
+                    continue
+                f = fitCurve(x, np.r_[hy[behind], robot[mine, 1]],
+                             np.r_[hw[behind], np.ones(np.count_nonzero(mine))], self.p.get('maxCurvature', 0.2))
+                if ownFit[j] or abs(curveAt(f, front) - curveAt(lines[j], front)) <= tol:
+                    cur[j] = f
+        return owner, near, distance
+
+    def _updateCropSupport(self, widths, near, owner, step):
+        """plants given to each row in this image, faded over the last metre driven"""
+        if self.cropSupport is None or len(self.cropSupport) != len(self.rows):
+            self.cropSupport = np.zeros((len(self.rows), 2))
+            self.cropSupportStart = self.odometer
+        self.cropSupport *= math.exp(-step / self.p.get('cropSupportLength', 1.0))
+        for k in range(len(self.rows)):
+            mine = near & (owner == k)
+            self.cropSupport[k] += (float(np.sum(widths[mine])), float(np.count_nonzero(mine)))
+
+    def _weakRow(self):
+        """a row of the lane made of small plants only, while the others are wide crops: the
+        lane slid onto weeds between two beds (a wheel path two furrows wide with weeds in its
+        middle looks like a row of the bed). A row without any plant (a gap) is not weak."""
+        ratio = self.p.get('cropWidthRatio', 0.4)
+        if ratio <= 0 or self.cropSupport is None or \
+                self.odometer - self.cropSupportStart < self.p.get('cropSupportLength', 1.0):
+            return None
+        sumW, n = self.cropSupport[:, 0], self.cropSupport[:, 1]
+        # a row with few points compared to the others is a gap (missing crops, a few weeds
+        # left in its line), not a weak row
+        seen = (n >= 3) & (n >= 0.25 * float(np.median(n)))
+        mean = np.where(seen, sumW / np.maximum(n, 1e-9), np.nan)
+        if np.count_nonzero(seen) >= 3:
+            ref = float(np.nanmedian(mean))
+            # the crop width of this row, kept over a recovery that finds only part of the lane
+            self.cropWidthRef = ref
+        elif getattr(self, 'cropWidthRef', None) is not None and np.any(seen):
+            ref = self.cropWidthRef
+        else:
+            return None
+        weak = [k for k in range(len(mean)) if seen[k] and mean[k] < ratio * ref]
+        if not weak:
+            return None
+        return 'row %s: small plants only (%.0f cm wide, rows %.0f cm): weeds, not the crop rows' % (
+            ','.join(str(k + 1) for k in weak), 100 * np.nanmin(mean), 100 * ref)
 
     def _deadReckoning(self, pose, xRef, reason):
         """keep the last lane center line (odom): straight on with the odometry"""

@@ -329,6 +329,10 @@ class imageProc:
                     + self.CropRows[:self.numOfCropRows, 0][:, None])
             nearestRow = np.argmin(np.abs(rowX - self.plantCenters2D[0][None, :]), axis=0)
         self.rowPixels = []
+        # vegetation width (pixels) of each row point, when the points come from bands
+        self.rowWidths = []
+        widths = self.plantWidths2D if self.plantWidths2D is not None and \
+            len(self.plantWidths2D) == self.numPlantsInScene else None
         # for all windows
         for boxIdx in range(0, self.numOfCropRows, 1):
             # define window
@@ -343,6 +347,7 @@ class imageProc:
                 self.updateTrackingBoxes(boxIdx, lineIntersection)
 
             plantsInCropRow = []
+            widthsInCropRow = []
             for ptIdx in range(self.numPlantsInScene):
                 # checking #points in upper/lower half of the image
                 self.checkPlantsLocTB(self.plantCenters2D[:, ptIdx])
@@ -352,7 +357,10 @@ class imageProc:
                 # if plant center is inside tracking box
                 if self.rowTrackingBoxes[boxIdx].contains(Point(self.plantCenters2D[0, ptIdx], self.plantCenters2D[1, ptIdx])):
                     plantsInCropRow.append(self.plantCenters2D[:, ptIdx])
+                    if widths is not None:
+                        widthsInCropRow.append(widths[ptIdx])
             self.rowPixels.append(plantsInCropRow)
+            self.rowWidths.append(widthsInCropRow if widths is not None else None)
 
             if len(plantsInCropRow) >= 2:
                 # flipped points
@@ -562,7 +570,7 @@ class imageProc:
             return self.cropLaneFound, self.cropRowEnd, self.P, self.ang
         # plants of the rows in the far half of the view: the row goes on
         xAhead = (xNear + xFar) / 2
-        if not tracker.update(self.rowPixels, self.robotPose, xRef, xNear, xAhead, self.exiting):
+        if not tracker.update(self.rowPixels, self.robotPose, xRef, xNear, xAhead, self.exiting, self.rowWidths):
             self.trackStatus = tracker.status
             self.log('#[ERR] ' + tracker.status)
             self.cropLaneFound = False
