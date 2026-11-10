@@ -127,7 +127,7 @@ class vs_nodeHandler(Node):
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('min_rows', 2)                   # rows needed for a lane center
         self.declare_parameter('furrow_width', 0.0)             # m between rows, 0: measured at start
-        self.declare_parameter('furrow_tolerance', 0.25)        # allowed row spacing error, fraction
+        self.declare_parameter('furrow_tolerance', 0.25)        # init: robot within half a furrow + this fraction of the lane center
         self.declare_parameter('min_furrow_width', 0.15)        # m, smaller spacing = wrong detection
         self.declare_parameter('max_row_angle_spread', 10.0)    # deg between rows at initialization
         self.declare_parameter('max_furrow_width', 1.2)         # m, longest row spacing searched

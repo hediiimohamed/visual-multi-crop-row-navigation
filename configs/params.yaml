@@ -45,7 +45,9 @@
     exg_blur: 5                    # px, blur before the threshold; 0 for seedlings of 1-3 px
     min_run_width: 3               # px, narrowest vegetation run giving a point (seedlings: 1)
     band_fill: 0.3                 # share of the band height a column must be green (seedlings: 0.1)
-    # Plants between scanStartPoint and scanEndPoint (image columns) are used to find the rows
+    # Plants between scanStartPoint and scanEndPoint (image columns) are used to find the rows by the
+    # image scanner only. ground_tracking: the rows are found in the tracked band (bottomOffset ..
+    # imgHeight - topOffset), across the whole width; the bed is told from its neighbours by the wheel paths
     minContourArea: 40
     scanSteps: 30
     scanStartPoint: 330            # bed rows at u~410..710 near, neighbour beds at u~270 and ~860
@@ -73,9 +75,12 @@
     base_frame: "base_link"
     min_rows: 2                    # rows needed to compute the lane center
     furrow_width: 0.0              # m between two rows; 0: measured from the rows found at start
-    furrow_tolerance: 0.25         # row spacing must be within +/-25 % of the furrow width
+    furrow_tolerance: 0.25         # robot within half a furrow + 25 % of the lane center at init
     max_furrow_width: 1.2          # m, longest row spacing searched when measuring it
-    lane_rows: 3                   # rows of one bed (sim: 3); 0: all evenly spaced rows found
+    # rows of one bed (sim: 3). 0: counted at the start of each row (the rows of the bed, 0.7 to 1.45
+    # furrow apart, up to the wheel paths). Set it for seedlings with dense weeds (a weed strip can
+    # count as a row) and for beds whose wheel path is under 1.45 furrow (rows 0.45 m apart on 1.5 m beds)
+    lane_rows: 3
     init_confirm_frames: 3         # the same lane must be found in 3 images before driving
     history_size: 400              # last plant centers kept per row (enough to reach under the robot)
     history_length: 1.0            # m of history kept behind the camera view (longer: lags in wavy rows)

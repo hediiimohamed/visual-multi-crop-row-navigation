@@ -143,6 +143,7 @@ class RowTracker:
         self.centerOdom = None      # same line in the odom frame: (x, y, direction)
         self.badFrames = 0
         self.status = 'not initialized'
+        self.laneConflict = None   # set by _matchLane: the whole lane seen away from the lane followed
         self.noPlantAhead = 0      # images in a row without row plants in the far half of the view
         self.plantAhead = 0        # images in a row with some
         self.noPlantSeen = 0       # images in a row without any row plant in the whole view
@@ -233,10 +234,14 @@ class RowTracker:
                 return False
             # the rows do not fit the lane followed before (its position comes from the
             # odometry, extrapolated over the recovery): a whole lane of laneRows rows around
-            # the robot (it is still within half a furrow of its center) is the same one
+            # the robot (it is still within half a furrow of its center) is the same one.
+            # laneConflict (see _matchLane): the lane followed had slid before the loss (the robot,
+            # slower to turn, is still on the right lane), or a weed strip is taken for a row: the
+            # robot tells, the lane around it is taken only when the robot is well inside it
+            maxOffset = 1.0 / 3 if self.laneConflict is not None else None
             memory, reason = self.lane, self.status
             self.lane = None
-            if not self._findLane(pixels, pose, xRef, widths):
+            if not self._findLane(pixels, pose, xRef, widths, maxOffset):
                 self.lane, self.status = memory, reason
                 self.candidates = []
                 return False
@@ -264,7 +269,9 @@ class RowTracker:
         self.initialized = True
         return True
 
-    def _findLane(self, pixels, pose, xRef, widths):
+    def _findLane(self, pixels, pose, xRef, widths, maxOffset=None):
+        """maxOffset: largest robot offset from the lane center, in furrows (default: half a
+        furrow + furrowTolerance)"""
         self.reset()
         self._advance(pose)
         pixels = np.asarray(pixels, dtype=float).reshape(-1, 2)
@@ -309,6 +316,18 @@ class RowTracker:
                     return self._fail('no periodic rows')
                 return self._fail('set furrow_width when following a single row')
             i = np.flatnonzero(band)[np.argmax(ac[band])]
+            # the furrow is the period of the rows, the fundamental: the rows of a bed also line
+            # up at 2, 3, 4 furrows (and the bed pitch), and one of these can correlate best.
+            # The smallest sub-multiple of the best lag that still correlates well is the furrow
+            for d in (4, 3, 2):
+                j0 = int(round(i / d))
+                if j0 * binSize < self.p['minFurrowWidth']:
+                    continue
+                lo_, hi_ = max(j0 - 2, 1), min(j0 + 3, len(ac) - 1)
+                j = lo_ + int(np.argmax(ac[lo_:hi_]))
+                if ac[j] >= 0.5 * ac[i] and ac[j] >= ac[j - 1] and ac[j] >= ac[j + 1]:
+                    i = j
+                    break
             # parabolic refinement of the period
             if 0 < i < len(ac) - 1 and (ac[i - 1] - 2 * ac[i] + ac[i + 1]) != 0:
                 i = i + 0.5 * (ac[i - 1] - ac[i + 1]) / (ac[i - 1] - 2 * ac[i] + ac[i + 1])
@@ -330,13 +349,18 @@ class RowTracker:
         if len(peaks) < self.p['minRows']:
             return self._fail('%d row(s) found, %d needed' % (len(peaks), self.p['minRows']))
 
-        # rows of one bed: evenly spaced chain around the robot (neighbour beds are further apart)
+        # rows of one bed: chain of neighbouring rows around the robot, up to the wheel paths.
+        # Rows of a bed are about one furrow apart (wavy rows: +-30 %), a wheel path is wider
+        # (1.7 furrow and more): two peaks belong to the same bed 0.7 to 1.45 furrow apart. A
+        # closer peak along the bed edge is a weed strip, not one more row of the bed
         tol = self.p['furrowTolerance'] * furrow
+        bedGap = self.p.get('bedGap', 1.45) * furrow
+        minGap = 0.7 * furrow
         k0 = int(np.argmin(np.abs(np.array(peaks) - self.p['targetOffset'])))
         lo = hi = k0
-        while lo > 0 and abs(peaks[lo] - peaks[lo - 1] - furrow) <= tol:
+        while lo > 0 and minGap <= peaks[lo] - peaks[lo - 1] <= bedGap:
             lo -= 1
-        while hi + 1 < len(peaks) and abs(peaks[hi + 1] - peaks[hi] - furrow) <= tol:
+        while hi + 1 < len(peaks) and minGap <= peaks[hi + 1] - peaks[hi] <= bedGap:
             hi += 1
         chain = peaks[lo:hi + 1]
         if len(chain) < self.p['minRows']:
@@ -368,6 +392,9 @@ class RowTracker:
         if self.lane is not None:
             # same row as before the loss: place the rows found into the known lane
             match = self._matchLane(lat0, pose, xMid)
+            if match is None and self.laneConflict is not None:
+                return self._fail('the whole lane is seen %.0f cm from the lane followed, part of it fits one '
+                                  'row over: not sure which rows are the lane' % (100 * self.laneConflict))
             if match is None:
                 return self._fail('rows found do not match the lane followed before')
             keep, offsets, furrow = match
@@ -384,9 +411,20 @@ class RowTracker:
         slope = float(np.mean([f[1] + 2 * f[2] * xRef for f in fits]))
         bend = float(np.mean([f[2] for f in fits]))
         offset = self.robotOffset(center, slope, xRef, bend)
-        if abs(offset) > furrow / 2 + tol:
-            return self._fail('robot %.2f m from the lane center, more than half a furrow' % offset)
+        limit = furrow / 2 + tol if maxOffset is None else maxOffset * furrow
+        if abs(offset) > limit:
+            return self._fail('robot %.2f m from the lane center, more than %.2f m' % (offset, limit))
 
+        offsets = list(offsets)
+        if self.lane is not None:
+            # the rows of the lane not found again are tracked too, from their place in the lane
+            # (empty until their plants are seen): the whole lane checks the consistency
+            for o in self.lane[0]:
+                if all(abs(o - q) > 1e-6 for q in offsets):
+                    rows.append(np.zeros((0, 4)))
+                    offsets.append(o)
+            order = np.argsort(offsets)
+            rows, offsets = [rows[j] for j in order], [offsets[j] for j in order]
         self.furrowWidth = furrow
         self.rows = rows
         self.offsets = list(offsets)
@@ -409,13 +447,15 @@ class RowTracker:
         self.centerOdom = centerOdom
         predicted = self._predictCenter(pose, xAt)[0]
         pattern = np.array(laneOffsets)
-        best = None
+        best = whole = None
         for shift in range(-len(lat) + 1, len(pattern)):
             pairs = [(j, j + shift) for j in range(len(lat)) if 0 <= j + shift < len(pattern)]
             if len(pairs) < self.p['minRows']:
                 continue
             center = np.mean([lat[j] - pattern[i] for j, i in pairs])
             err = abs(center - predicted)
+            if len(pairs) == len(pattern) and (whole is None or err < whole):
+                whole = err
             if err > furrow / 2:
                 continue
             # as many rows of the lane as possible, then the center closest to the prediction
@@ -423,6 +463,14 @@ class RowTracker:
             if best is None or len(pairs) > len(best[1]) or (len(pairs) == len(best[1]) and err < best[0]):
                 best = (err, pairs)
         if best is None:
+            return None
+        if len(best[1]) < len(pattern) and whole is not None and whole > furrow / 2:
+            # as many peaks as the lane has rows, but not where the lane was followed, while part
+            # of the lane fits there: either the lane had slid before the loss (bend, weeds) and the
+            # prediction is one row off, or a weed strip along the bed edge is taken for a row and
+            # a row of the lane is missed. The rows cannot tell which: no match, initialize takes the
+            # whole lane around the robot only if the robot is well inside it, else the robot stops
+            self.laneConflict = whole
             return None
         return [j for j, _ in best[1]], [pattern[i] for _, i in best[1]], furrow
 
@@ -518,7 +566,15 @@ class RowTracker:
         consistent = weight > 0
         for j in np.flatnonzero(~consistent):
             newRows[valid[j]] = self._keepNear(newRows[valid[j]], lines[valid[j]], pose, gate)
-        if np.count_nonzero(consistent) < self.p['minRows']:
+        # the lane holds while most of its well seen rows agree: in a sharp bend two rows of four
+        # can drift together onto their neighbours, and two against two tells nothing. A row seen
+        # again after a gap (a few plants, its fit not settled yet) does not vote, and with fewer
+        # than 3 such rows each row is checked against the lane followed: min_rows of them do
+        strong = np.array([len(newRows[k]) >= 2 * self.p['minPoints'] for k in valid])
+        enough = np.count_nonzero(consistent) >= self.p['minRows']
+        if np.count_nonzero(strong) >= 3:
+            enough = enough and np.count_nonzero(consistent & strong) >= np.count_nonzero(strong) // 2 + 1
+        if not enough:
             reason = 'rows not evenly spaced (%s cm from the lane)' % np.round(100 * dev).astype(int).tolist()
             if exiting:
                 self.rows = newRows
@@ -587,9 +643,11 @@ class RowTracker:
     def _assign(self, robot, lines, gateAt, pose, xNear):
         """each plant of the image to one row (owner) if within the gate of its line (near).
         Each plant goes to the closest row only: two rows can never share plants, so a row
-        cannot slide onto its neighbour. The rows are grown from the robot outwards, one
-        metre at a time, refitted on the plants accepted so far: in a bend the far plants
-        leave the row extrapolated over 6 m, but not the one extrapolated over 1 m.
+        cannot slide onto its neighbour. The rows are grown from the robot outwards, half a
+        metre at a time (growStep), refitted on the plants accepted so far: in a bend the far
+        plants leave the row extrapolated over 3 m, but not the one extrapolated over 0.5 m
+        (1 m steps let the rows of a sharp bend take the plants of their neighbour, all of them
+        together, which no spacing check can see).
         A row on its lane place (its own fit had drifted, see _expectedLines) is grown from the
         plants of this image only, and only while it stays at that place: its history is the
         drifted one."""
@@ -608,7 +666,7 @@ class RowTracker:
             else:
                 hist.append((np.zeros(0), np.zeros(0), np.zeros(0)))
         cur = list(lines)
-        step = self.p.get('growStep', 1.0)
+        step = self.p.get('growStep', 0.5)
         fronts = np.arange(xNear + step, robot[:, 0].max() + step, step) if step > 0 else [np.inf]
         done = np.zeros(len(robot), dtype=bool)
         for k, front in enumerate(fronts):

@@ -133,10 +133,16 @@ class imageProc:
         return self.cropLaneFound
 
     def findCropRowsGround(self):
-        """initialize the ground tracker with the plants between scanStartPoint and scanEndPoint"""
+        """initialize the ground tracker with the plants of the tracked view (the image rows
+        between bottomOffset and imgHeight - topOffset, the band the tracking boxes cover),
+        across the whole image width: the bed is told from its neighbours by the wheel paths
+        (groundTracker), not by an image window. scanStartPoint / scanEndPoint are not used
+        here: a column window tuned for one camera cuts the outer rows of a bed seen by a wider
+        lens (lane_rows 0 then counts too few rows), and the far plants above the view
+        (rows shifted by the field's bends, neighbour beds) blur the row spacing"""
         tracker = self.groundTracker
         u, v = self.plantCenters2D
-        inScan = (u >= self.scannerParams["scanStartPoint"]) & (u <= self.scannerParams["scanEndPoint"])
+        inScan = (v >= self.trackerParams["bottomOffset"]) & (v <= self.imgHeight - self.trackerParams["topOffset"])
         xNear, xFar = tracker.viewRange(self.imgHeight, self.trackerParams["topOffset"])
         widths = self.plantWidths2D[inScan] if self.plantWidths2D is not None else None
         self.cropLaneFound = tracker.initialize(np.c_[u[inScan], v[inScan]], self.robotPose, xNear, widths)
