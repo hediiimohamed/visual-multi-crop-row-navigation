@@ -75,7 +75,7 @@
     base_frame: "base_link"
     min_rows: 2                    # rows needed to compute the lane center
     furrow_width: 0.0              # m between two rows; 0: measured from the rows found at start
-    furrow_tolerance: 0.25         # robot within half a furrow + 25 % of the lane center at init
+    furrow_tolerance: 0.25         # no longer used: at init the robot must be within max_lateral_error, as when tracking
     max_furrow_width: 1.2          # m, longest row spacing searched when measuring it
     # rows of one bed (sim: 3). 0: counted at the start of each row (the rows of the bed, 0.7 to 1.45
     # furrow apart, up to the wheel paths). Set it for seedlings with dense weeds (a weed strip can

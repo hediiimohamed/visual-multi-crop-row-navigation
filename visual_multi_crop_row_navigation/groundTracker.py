@@ -125,6 +125,7 @@ class RowTracker:
         self.laneRowsFound = 0      # rows of the lane found at the start of this row (laneRows 0: measured)
         self.initialized = False
         self.candidates = []        # lanes found in the last images, before confirmation
+        self.offLaneFrames = 0      # init images in a row finding the lane with the robot too far from it
 
     def reset(self):
         # lane of this row (row offsets, furrow, last center in odom), kept across a recovery
@@ -144,6 +145,7 @@ class RowTracker:
         self.badFrames = 0
         self.status = 'not initialized'
         self.laneConflict = None   # set by _matchLane: the whole lane seen away from the lane followed
+        self.offLane = None        # set by _findLane: lane found, the robot further from it than tracking allows
         self.noPlantAhead = 0      # images in a row without row plants in the far half of the view
         self.plantAhead = 0        # images in a row with some
         self.noPlantSeen = 0       # images in a row without any row plant in the whole view
@@ -228,8 +230,10 @@ class RowTracker:
         lateral histogram, one row per peak, then the evenly spaced rows around the robot.
         widths: vegetation width (pixels) at each point, wide rows outweigh small weeds.
         True once the same lane was found in initConfirmFrames images in a row."""
+        recovering = self.lane is not None
         if not self._findLane(pixels, pose, xRef, widths):
             if self.lane is None or self._laneRows() <= 0:
+                self._countOffLane(recovering)
                 self.candidates = []
                 return False
             # the rows do not fit the lane followed before (its position comes from the
@@ -242,9 +246,11 @@ class RowTracker:
             memory, reason = self.lane, self.status
             self.lane = None
             if not self._findLane(pixels, pose, xRef, widths, maxOffset):
+                self._countOffLane(recovering)
                 self.lane, self.status = memory, reason
                 self.candidates = []
                 return False
+        self.offLaneFrames = 0
         # confirmation: same rows (odom), same furrow, in consecutive images
         lane = (self.centerOdom, len(self.rows), self.furrowWidth)
         if self.candidates:
@@ -270,8 +276,8 @@ class RowTracker:
         return True
 
     def _findLane(self, pixels, pose, xRef, widths, maxOffset=None):
-        """maxOffset: largest robot offset from the lane center, in furrows (default: half a
-        furrow + furrowTolerance)"""
+        """maxOffset: stricter limit of the robot offset from the lane center, in furrows (the
+        default is the tracking one, maxLateralError)"""
         self.reset()
         self._advance(pose)
         pixels = np.asarray(pixels, dtype=float).reshape(-1, 2)
@@ -353,7 +359,6 @@ class RowTracker:
         # Rows of a bed are about one furrow apart (wavy rows: +-30 %), a wheel path is wider
         # (1.7 furrow and more): two peaks belong to the same bed 0.7 to 1.45 furrow apart. A
         # closer peak along the bed edge is a weed strip, not one more row of the bed
-        tol = self.p['furrowTolerance'] * furrow
         bedGap = self.p.get('bedGap', 1.45) * furrow
         minGap = 0.7 * furrow
         k0 = int(np.argmin(np.abs(np.array(peaks) - self.p['targetOffset'])))
@@ -377,12 +382,13 @@ class RowTracker:
 
         # each row: its plants, line fitted on them
         gate = min(0.4 * furrow, max(self.p['gateRatio'] * furrow, self.p['minGate']))
-        fits, rows = [], []
+        fits, rows, nearX = [], [], []
         for c in chain:
             near = np.abs(lat - c) <= gate
             if np.count_nonzero(near) < self.p['minPoints']:
                 return self._fail('row at %+.2f m has too few plants' % c)
             fits.append(fitCurve(robot[near, 0], robot[near, 1], weight[near], self.p.get('maxCurvature', 0.2)))
+            nearX.append(float(np.min(robot[near, 0])))
             rows.append(np.c_[odom[near], np.ones(np.count_nonzero(near)),
                               np.full(np.count_nonzero(near), self.odometer)])
         # rows compared where their plants are seen: at xRef (bottom of the image, maybe hidden
@@ -400,6 +406,7 @@ class RowTracker:
             keep, offsets, furrow = match
             fits = [fits[j] for j in keep]
             rows = [rows[j] for j in keep]
+            nearX = [nearX[j] for j in keep]
             lat0 = lat0[keep]
         headings = np.degrees(np.arctan([f[1] + 2 * f[2] * xMid for f in fits]))
         if np.max(np.abs(headings - np.median(headings))) > self.p['maxRowAngleSpread']:
@@ -410,10 +417,22 @@ class RowTracker:
         center = float(np.mean([curveAt(f, xRef) for f in fits]) - np.mean(offsets))
         slope = float(np.mean([f[1] + 2 * f[2] * xRef for f in fits]))
         bend = float(np.mean([f[2] for f in fits]))
-        offset = self.robotOffset(center, slope, xRef, bend)
-        limit = furrow / 2 + tol if maxOffset is None else maxOffset * furrow
-        if abs(offset) > limit:
-            return self._fail('robot %.2f m from the lane center, more than %.2f m' % (offset, limit))
+        # robot offset measured as tracking does (update): at the nearest plants, not extrapolated
+        # under the robot, and within the same limit: a lane found with the robot further than
+        # tracking allows is not taken (tracking would reject it at once, and the robot would creep
+        # on in loss / recovery cycles, off the lane, wheels towards the crops)
+        offset = self.robotOffset(center, slope, xRef, bend, at=min(max(min(nearX), 0.0), xRef))
+        maxLateral = self.p['maxLateralError'] if self.p['maxLateralError'] > 0 else furrow / 2
+        if abs(offset) > maxLateral:
+            if maxOffset is None and abs(offset) <= furrow:
+                # (not after a lane conflict: there the lane around the robot is itself in doubt, a few
+                # steps forward can settle it; nor a "lane" more than a furrow away: rows of two beds
+                # taken for one lane, not the robot off its lane)
+                self.offLane = offset
+            return self._fail('robot %.0f cm from the lane center, more than %.0f cm: the wheels would '
+                              'go onto the crop rows' % (100 * offset, 100 * maxLateral))
+        if maxOffset is not None and abs(offset) > maxOffset * furrow:
+            return self._fail('robot %.2f m from the lane center, more than %.2f m' % (offset, maxOffset * furrow))
 
         offsets = list(offsets)
         if self.lane is not None:
@@ -435,6 +454,17 @@ class RowTracker:
         self.status = 'tracking %d rows, furrow %.2f m (%s)' % (len(rows), furrow,
                                                               'set' if self.p['furrowWidth'] > 0 else 'measured')
         return True
+
+    def _countOffLane(self, recovering):
+        # only after a loss: at the start of a row the robot was just placed on its lane, a lane found
+        # away from it is a wrong guess (weeds, merged beds), not the robot off its lane
+        self.offLaneFrames = self.offLaneFrames + 1 if self.offLane is not None and recovering else 0
+
+    def robotOffLane(self):
+        """the lane was found in initConfirmFrames images in a row, but the robot is further from its
+        center than tracking allows: driving on (recovery steps) would take the wheels onto the
+        crop rows, the robot must stop"""
+        return self.offLaneFrames >= max(self.p.get('initConfirmFrames', 1), 1)
 
     def _laneRows(self):
         """rows of one lane: the laneRows parameter, else as many as found at the start of the row"""
