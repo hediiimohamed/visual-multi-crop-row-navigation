@@ -119,6 +119,9 @@
     # within max_path_deviation of base_link, or FAILED. Set it above how far the real rows
     # wander from the plan (RTK seeding: 0.3; Isaac beds2/3/weeds2 manual seeding: 0.6-0.7)
     reference_path_topic: ""       # "": off
+    # vision box (phenotyping cameras under the robot, pheno_interfaces/Plants topics, e.g.
+    # ["/ET01_T_P/plant_map_row1/plants"]): its weeds are taken out of the tracked rows. [""]: off
+    vision_box_topics: [""]
     max_path_deviation: 0.5        # m
     path_deviation_frames: 5       # images in a row beyond it
 

@@ -163,6 +163,9 @@ class vs_nodeHandler(Node):
         self.declare_parameter('reference_path_topic', '')      # '' : off
         self.declare_parameter('max_path_deviation', 0.5, ParameterDescriptor(dynamic_typing=True))  # m from the path -> FAILED
         self.declare_parameter('path_deviation_frames', 5)      # images in a row beyond it
+        # vision box (phenotyping cameras under the robot, pheno_interfaces/Plants): the plants it
+        # classifies as weeds are taken out of the tracked rows. A complement: off when empty
+        self.declare_parameter('vision_box_topics', [''])
 
         # Get parameter values
         self.frontColor_topic = self.get_parameter('frontColor_topic').value
@@ -234,6 +237,18 @@ class vs_nodeHandler(Node):
                 self.create_subscription(Path, pathTopic, self.path_callback,
                                          QoSProfile(depth=1, durability=durability))
             self.path_deviation_pub = self.create_publisher(Float32, 'vs_nav/path_deviation', 1)
+        boxTopics = [t for t in self.get_parameter('vision_box_topics').value if t]
+        if boxTopics:
+            try:
+                from pheno_interfaces.msg import Plants
+            except ImportError:
+                self.get_logger().error("vision_box_topics set but pheno_interfaces is not installed: vision box off")
+            else:
+                # the plant map publishes best effort
+                boxQos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+                for t in boxTopics:
+                    self.create_subscription(Plants, t, self.plants_callback, boxQos)
+                self.get_logger().info(f"Vision box weeds taken out of the rows, from {boxTopics}")
 
         # settings
         self.navigationMode = self.get_parameter('navigationMode').value                   
@@ -869,6 +884,30 @@ class vs_nodeHandler(Node):
         self.row_end_pub.publish(Bool(data=True))
         self.get_logger().info(f"Row finished ({reason}): robot stopped, waiting for vs_nav/start")
         self.setState('ROW_END', reason)
+
+    def plants_callback(self, msg):
+        """vision box plants (stems in the tool frame) -> odom, crop / weed, to the tracker"""
+        tracker = self.imageProcessor.groundTracker
+        if tracker is None or not msg.plants:
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(self.odomFrame, msg.header.frame_id, Time.from_msg(msg.header.stamp))
+        except tf2_ros.TransformException:
+            try:
+                tf = self.tf_buffer.lookup_transform(self.odomFrame, msg.header.frame_id, Time())
+            except tf2_ros.TransformException as e:
+                self.get_logger().warn(f"vision box: no {self.odomFrame} -> {msg.header.frame_id} transform: {e}",
+                                       throttle_duration_sec=5.0)
+                return
+        t, q = tf.transform.translation, tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        c, sn = math.cos(yaw), math.sin(yaw)
+        pts = np.array([(p.stem_point.x, p.stem_point.y) for p in msg.plants])
+        odom = np.c_[t.x + c * pts[:, 0] - sn * pts[:, 1], t.y + sn * pts[:, 0] + c * pts[:, 1]]
+        # band mode: the crop is a band, the plants are weeds only
+        isCrop = [False if msg.band_mode else not p.is_weed for p in msg.plants]
+        tracker.addBoxPlants(odom, isCrop)
+        self.boxPlantsSeen = getattr(self, 'boxPlantsSeen', 0) + len(msg.plants)
 
     def path_callback(self, msg):
         points = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]

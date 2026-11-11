@@ -125,6 +125,8 @@ class RowTracker:
         self.laneRowsFound = 0      # rows of the lane found at the start of this row (laneRows 0: measured)
         self.initialized = False
         self.candidates = []        # lanes found in the last images, before confirmation
+        self.boxWeeds = np.zeros((0, 2))   # vision box (cameras under the robot): weeds / crops in odom
+        self.boxCrops = np.zeros((0, 2))
         self.offLaneFrames = 0      # init images in a row finding the lane with the robot too far from it
 
     def reset(self):
@@ -559,6 +561,8 @@ class RowTracker:
 
         newRows = [self._merge(self.rows[k], candidates[k]) for k in range(len(self.rows))]
         newRows = [self._prune(r, pose, xNear) for r in newRows]
+        if len(self.boxWeeds):
+            newRows = self._boxClean(newRows)
         valid = [k for k, r in enumerate(newRows)
                  if len(r) >= self.p['minPoints']
                  and self.odometer - np.max(r[:, 3]) <= self.p['maxRowGap']]
@@ -839,6 +843,40 @@ class RowTracker:
             return rows, None
         a, b = self.center
         return rows, line((a - b * xRef + self.curvature * xRef ** 2, b - 2 * self.curvature * xRef, self.curvature))
+
+    def addBoxPlants(self, odomXY, isCrop):
+        """plants classified by the vision box (phenotyping cameras under the robot), odom frame.
+        A complement of the navigation camera, not a replacement: the plants it calls weeds are
+        taken out of the row histories (they pass under the box after having been seen ahead),
+        so weed patches stop pulling the rows"""
+        odomXY = np.asarray(odomXY, dtype=float).reshape(-1, 2)
+        if not len(odomXY):
+            return
+        isCrop = np.asarray(isCrop, dtype=bool)
+        keep = self.p.get('boxMemory', 600)
+        self.boxWeeds = np.vstack([self.boxWeeds, odomXY[~isCrop]])[-keep:]
+        self.boxCrops = np.vstack([self.boxCrops, odomXY[isCrop]])[-keep:]
+
+    def boxDetections(self, pose, xy, isCrop):
+        """same, plants in the robot frame (x forward, y left)"""
+        xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        if len(xy):
+            ox, oy = toOdom(pose, xy[:, 0], xy[:, 1])
+            self.addBoxPlants(np.c_[ox, oy], isCrop)
+
+    def _boxClean(self, rows):
+        """row histories without the plants the vision box saw as weeds (and not as crops: a crop
+        detection closer wins, the box can be wrong)"""
+        r0 = self.p.get('boxRadius', 0.04)
+        out = []
+        for r in rows:
+            if len(r):
+                dw = np.min(np.hypot(r[:, 0:1] - self.boxWeeds[None, :, 0], r[:, 1:2] - self.boxWeeds[None, :, 1]), axis=1)
+                dc = (np.min(np.hypot(r[:, 0:1] - self.boxCrops[None, :, 0], r[:, 1:2] - self.boxCrops[None, :, 1]), axis=1)
+                      if len(self.boxCrops) else np.full(len(r), np.inf))
+                r = r[~((dw < r0) & (dw < dc))]
+            out.append(r)
+        return out
 
     def _merge(self, row, odom):
         """add plant centers; one seen again (within merge radius) is averaged, not duplicated"""
